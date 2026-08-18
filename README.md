@@ -12,7 +12,7 @@ NanaLiveSDK/
 ├── LICENSE
 ├── SDK/                 # 对外 SDK（协议、绑定、脚手架）
 ├── Plugins/             # 官方 Plugin 示例，一插件一目录
-├── Docs/                # VitePress 文档站（含插件登记表单）
+├── Docs/                # VitePress 文档站（含插件市场）
 ├── registry/            # 第三方插件元数据，不含源码
 └── .github/             # Issue 表单与自动开 PR 的 Actions
 ```
@@ -23,8 +23,8 @@ NanaLiveSDK/
 | --- | --- |
 | [SDK](SDK) | SDK 本体：协议定义、语言绑定、插件模板 |
 | [Plugins](Plugins) | 官方示例插件（不接受第三方投稿），一插件一个子目录 |
-| [Docs](Docs) | 快速开始、插件开发指南、API 索引、登记表单 |
-| [registry](registry) | 已审核第三方插件的名称、仓库与简介 |
+| [Docs](Docs) | 快速开始、插件开发指南、API 索引、插件市场 |
+| [registry](registry) | 已审核第三方插件的名称、仓库、简介与市场指标 |
 
 ## 从哪里开始
 
@@ -48,7 +48,7 @@ SDK 实现、示例插件与文档正文将随协议稳定后陆续补充。
 
 ## 贡献
 
-欢迎通过 Issue 与 Pull Request 改进 SDK、官方示例与文档。第三方插件请放在自己的仓库并打上 `nanalive` 标签，再通过 [登记插件](Docs/store/publish.md) 提交元数据。
+欢迎通过 Issue 与 Pull Request 改进 SDK、官方示例与文档。第三方插件请放在自己的仓库并打上 `nanalive` topic，再通过 [登记插件](Docs/store/publish.md) 提交元数据。
 
 ## 许可证
 

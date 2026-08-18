@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { githubJson, parseRepo } from "./github-api.mjs";
 
 const REPO_RE =
   /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/?$/;
@@ -59,6 +60,17 @@ if (!name || name.length > 50) throw new Error("插件名称无效或过长");
 if (!REPO_RE.test(repo)) throw new Error("仓库地址必须是 https://github.com/owner/repo");
 if (!description || description.length > 200) throw new Error("简介无效或过长");
 
+const parsed = parseRepo(repo);
+if (!parsed) throw new Error("仓库地址必须是 https://github.com/owner/repo");
+const remote = await githubJson(`/repos/${parsed.owner}/${parsed.name}`);
+if (!remote) throw new Error(`仓库不存在或未公开：${repo}`);
+const topics = (remote.topics || []).map((topic) => topic.toLowerCase());
+if (!topics.includes("nanalive")) {
+  throw new Error(
+    `仓库缺少 GitHub topic「nanalive」。请在 ${parsed.slug} 的 Settings → Topics 添加后再提交。`,
+  );
+}
+
 const registryPath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   "../../registry/plugins.json",
@@ -69,7 +81,22 @@ if (registry.plugins.some((plugin) => plugin.repo.replace(/\/$/, "") === repo)) 
   throw new Error(`仓库已登记：${repo}`);
 }
 
-registry.plugins.push({ name, repo, description, tags, issue: issue.number });
+registry.plugins.push({
+  name,
+  repo,
+  description,
+  tags,
+  issue: issue.number,
+  license: remote.license?.spdx_id && remote.license.spdx_id !== "NOASSERTION"
+    ? remote.license.spdx_id
+    : null,
+  archived: Boolean(remote.archived),
+  missingTopic: false,
+  stars: Number(remote.stargazers_count || 0),
+  pushedAt: remote.pushed_at || null,
+  quality: null,
+  qualityTier: null,
+});
 registry.plugins.sort((a, b) => a.name.localeCompare(b.name, "en"));
 fs.writeFileSync(registryPath, `${JSON.stringify(registry, null, 2)}\n`);
 out("name", name);

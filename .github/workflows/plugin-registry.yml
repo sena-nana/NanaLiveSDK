@@ -17,6 +17,8 @@ jobs:
 
       - name: Update registry
         id: registry
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node .github/scripts/update-plugin-registry.mjs
 
       - uses: peter-evans/create-pull-request@v7

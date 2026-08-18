@@ -6,6 +6,6 @@
 2. 以仓库 [`SDK/`](https://github.com/sena-nana/NanaLiveSDK/tree/main/SDK) 为依赖
 3. 对照 [`Plugins/`](https://github.com/sena-nana/NanaLiveSDK/tree/main/Plugins) 官方示例
 
-第三方插件请放在自己的仓库并打上 `nanalive` 标签，再通过 [登记插件](/store/publish) 提交元数据。
+第三方插件请放在自己的仓库并打上 `nanalive` topic，再通过 [登记插件](/store/publish) 提交元数据。
 
 本地预览：`cd Docs && npm install && npm run docs:dev`。部署见 [部署文档站](/guide/deploy)。

@@ -8,7 +8,7 @@ body:
       value: |
         请优先通过文档站的插件登记页填写，再跳转到本表单确认提交。
 
-        本仓库 **不接受第三方插件源码**。请把插件放在自己的公开仓库，并打上 `nanalive` 标签。此处只登记名称、仓库地址与简介。
+        本仓库 **不接受第三方插件源码**。请把插件放在自己的公开仓库，并先打上 `nanalive` topic（登记 Action 会校验，没有则失败）。此处只登记名称、仓库地址与简介。
 
   - type: input
     id: name
@@ -23,7 +23,7 @@ body:
     id: repo
     attributes:
       label: 仓库地址
-      description: 公开的 GitHub 仓库 HTTPS 地址，且应带有 nanalive 标签
+      description: 公开的 GitHub 仓库 HTTPS 地址。提交前必须已添加 nanalive topic
       placeholder: e.g. https://github.com/owner/nanalive-plugin-hello
     validations:
       required: true

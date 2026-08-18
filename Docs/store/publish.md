@@ -2,7 +2,7 @@
 
 填写后会跳转到 GitHub Issue 预填页，确认后点 `Submit new issue`。维护者合并 PR 后会出现在 [已登记插件](/store/)。
 
-插件源码放在你自己的公开仓库，并打上 `nanalive` 标签，不要提交到 `Plugins/`。需要登录 GitHub。
+插件源码放在你自己的公开仓库，并先打上 `nanalive` topic（GitHub 仓库页右栏 Topics）。登记 Action 会校验，没有该标签则失败、不开 PR。不要把源码提交到 `Plugins/`。需要登录 GitHub。
 
 <script setup>
 const REPO = "sena-nana/NanaLiveSDK";
