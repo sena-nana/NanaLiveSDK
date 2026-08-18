@@ -1,0 +1,47 @@
+name: 登记插件
+title: "Plugin: {name}"
+description: 将第三方插件元数据登记到本仓库（不提交源码）
+labels: ["Plugin", "Publish"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请优先通过文档站的插件登记页填写，再跳转到本表单确认提交。
+
+        本仓库 **不接受第三方插件源码**。请把插件放在自己的公开仓库，并打上 `nanalive` 标签。此处只登记名称、仓库地址与简介。
+
+  - type: input
+    id: name
+    attributes:
+      label: 插件名称
+      description: 对外展示的插件名称，建议与仓库名对应
+      placeholder: e.g. hello-world
+    validations:
+      required: true
+
+  - type: input
+    id: repo
+    attributes:
+      label: 仓库地址
+      description: 公开的 GitHub 仓库 HTTPS 地址，且应带有 nanalive 标签
+      placeholder: e.g. https://github.com/owner/nanalive-plugin-hello
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 简介
+      description: 一两句话说明插件做什么。请保持简短，避免过长导致无法预填。
+      placeholder: e.g. 在直播间展示自定义文字叠层
+    validations:
+      required: true
+
+  - type: input
+    id: tags
+    attributes:
+      label: 标签
+      description: 逗号分隔，最多 5 个，每个不超过 20 个字符
+      placeholder: e.g. overlay, chat
+    validations:
+      required: false

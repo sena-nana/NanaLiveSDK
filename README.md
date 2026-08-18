@@ -11,20 +11,20 @@ NanaLiveSDK/
 ├── README.md
 ├── LICENSE
 ├── SDK/                 # 对外 SDK（协议、绑定、脚手架）
-│   └── README.md
 ├── Plugins/             # 官方 Plugin 示例，一插件一目录
-│   └── README.md
-└── Docs/                # 开发者文档
-    └── README.md
+├── Docs/                # VitePress 文档站（含插件登记表单）
+├── registry/            # 第三方插件元数据，不含源码
+└── .github/             # Issue 表单与自动开 PR 的 Actions
 ```
 
-三个最高层级职责互不重叠：
+最高层级职责互不重叠：
 
 | 目录 | 职责 |
 | --- | --- |
 | [SDK](SDK) | SDK 本体：协议定义、语言绑定、插件模板 |
 | [Plugins](Plugins) | 官方示例插件（不接受第三方投稿），一插件一个子目录 |
-| [Docs](Docs) | 快速开始、插件开发指南、API 索引 |
+| [Docs](Docs) | 快速开始、插件开发指南、API 索引、登记表单 |
+| [registry](registry) | 已审核第三方插件的名称、仓库与简介 |
 
 ## 从哪里开始
 
@@ -44,13 +44,11 @@ SDK 实现、示例插件与文档正文将随协议稳定后陆续补充。
 
 ## Docs
 
-[Docs](Docs) 是开发者文档入口。使用说明与 API 文档放在这里，实现代码不放在这里。
+[Docs](Docs) 是 VitePress 文档站。`cd Docs && npm install && npm run docs:dev`。部署见 [Docs/guide/deploy.md](Docs/guide/deploy.md)。
 
 ## 贡献
 
-欢迎通过 Issue 与 Pull Request 改进 SDK、官方示例与文档。
-
-本仓库 **不接受第三方插件投稿**。第三方插件请放在自己的仓库中，并为仓库打上 `nanalive` 标签，便于检索与发现。
+欢迎通过 Issue 与 Pull Request 改进 SDK、官方示例与文档。第三方插件请放在自己的仓库并打上 `nanalive` 标签，再通过 [登记插件](Docs/store/publish.md) 提交元数据。
 
 ## 许可证
 
