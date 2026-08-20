@@ -7,16 +7,10 @@ export default defineConfig({
   title: "NanaLive SDK",
   description: "NanaLive SDK 与插件开发文档",
   srcExclude: ["README.md"],
-  vite: {
-    server: {
-      fs: { allow: [".."] },
-    },
-  },
   themeConfig: {
     nav: [
       { text: "指南", link: "/guide/" },
       { text: "API", link: "/api/" },
-      { text: "插件市场", link: "/store/" },
     ],
     sidebar: {
       "/guide/": [
@@ -26,15 +20,6 @@ export default defineConfig({
             { text: "快速开始", link: "/guide/" },
             { text: "插件开发", link: "/guide/plugin" },
             { text: "部署文档站", link: "/guide/deploy" },
-          ],
-        },
-      ],
-      "/store/": [
-        {
-          text: "插件",
-          items: [
-            { text: "插件市场", link: "/store/" },
-            { text: "登记插件", link: "/store/publish" },
           ],
         },
       ],

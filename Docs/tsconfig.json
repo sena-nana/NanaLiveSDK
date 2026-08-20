@@ -5,15 +5,9 @@
     "moduleResolution": "bundler",
     "strict": true,
     "jsx": "preserve",
-    "resolveJsonModule": true,
     "isolatedModules": true,
     "lib": ["ES2022", "DOM"],
     "types": ["vitepress/client"]
   },
-  "include": [
-    ".vitepress/**/*.ts",
-    ".vitepress/**/*.vue",
-    ".vitepress/**/*.d.ts",
-    ".vitepress/env.d.ts"
-  ]
+  "include": [".vitepress/**/*.ts"]
 }

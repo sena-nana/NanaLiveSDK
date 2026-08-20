@@ -1,5 +1,1 @@
 blank_issues_enabled: true
-contact_links:
-  - name: 登记第三方插件
-    url: https://github.com/sena-nana/NanaLiveSDK/issues/new?template=plugin_publish.yml
-    about: 请优先通过文档站登记页填写；也可以用此 Issue 表单。不要把插件源码开到 Plugins/。
