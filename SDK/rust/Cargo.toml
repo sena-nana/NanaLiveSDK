@@ -1,0 +1,16 @@
+[package]
+name = "nanalive-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "NanaLive 插件 API 的 Rust 客户端绑定"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+rmpv = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

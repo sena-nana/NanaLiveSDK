@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <PackageId>Nanalive.Sdk</PackageId>
+    <Version>0.1.0</Version>
+    <Description>NanaLive 插件 API 的 C# 客户端绑定</Description>
+    <License>MIT</License>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="MessagePack" Version="2.5.*" />
+  </ItemGroup>
+
+</Project>

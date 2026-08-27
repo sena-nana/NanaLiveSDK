@@ -3,3 +3,21 @@ dist/
 Docs/.vitepress/cache/
 Docs/.vitepress/dist/
 .DS_Store
+
+# Rust
+target/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# .NET
+bin/
+obj/
+*.user
+
+# 本地工作区
+.zcode/

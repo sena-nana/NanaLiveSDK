@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/examples/">
+    <Project Path="examples/ListModels/ListModels.csproj" />
+  </Folder>
+  <Project Path="Nanalive.Sdk.Tests/Nanalive.Sdk.Tests.csproj" />
+  <Project Path="Nanalive.Sdk/Nanalive.Sdk.csproj" />
+</Solution>

@@ -49,6 +49,47 @@ await client.authenticate();
 const models = await client.listModels();
 ```
 
+## 其他语言绑定
+
+四个语言绑定的协议语义一致（常量、envelope、鉴权、助手函数），差异只在语言习惯：
+
+| 绑定 | 安装 / 引用 | 连接方式 |
+| --- | --- | --- |
+| [Rust](https://github.com/sena-nana/NanaLiveSDK/tree/main/SDK/rust) | `nanalive-sdk = "0.1"` | `connect(ConnectOptions)` |
+| [Python](https://github.com/sena-nana/NanaLiveSDK/tree/main/SDK/python) | `pip install nanalive-sdk` | `await connect(...)` |
+| [C#](https://github.com/sena-nana/NanaLiveSDK/tree/main/SDK/csharp) | 引用 `Nanalive.Sdk` 项目 | `await NanaLiveConnection.ConnectAsync(...)` |
+
+以 Python 为例的最小流程（其余语言见各自 README，结构相同）：
+
+```python
+from nanalive_sdk import connect, DEFAULT_PORT
+
+connection = await connect(
+    port=DEFAULT_PORT,
+    identity={
+        "pluginID": "dev.example.my-plugin",
+        "pluginName": "My Plugin",
+        "pluginDeveloper": "Example",
+        "pluginVersion": "0.1.0",
+        "scopes": ["model.read", "model.switch"],
+    },
+    on_token=save_token,
+)
+try:
+    await connection.client.authenticate()
+    models = await connection.client.list_models()
+finally:
+    await connection.close()
+```
+
+注意：
+
+- 各绑定都不做自动重连与心跳，断线后请重建连接并重新 `authenticate()`
+  （旧 token 仍有效时会直接验证通过）。
+- 未配对的响应（服务器主动推送）会透传给调用方：Rust 的 `on_unhandled`
+  回调 / `receive` 返回值、Python 的 `on_unhandled` 回调 / `receive` 返回值、
+  C# 的 `OnUnhandled` 事件 / `Receive` 返回值、JS 的 `receive` 返回值。
+
 ## 其他
 
 Rust 侧的协议与消息定义目前随主程序仓库（`nanalive-plugin-api` crate）发布，正式外发到本仓库 `SDK/` 后会在此补充索引。

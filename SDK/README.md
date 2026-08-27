@@ -8,7 +8,14 @@
 - 各语言绑定
 - 插件脚手架 / 模板
 
-当前已有 JavaScript 客户端绑定 [`js/`](./js)（`@nanalive/sdk`）：NanaLive 插件 API 的连接、鉴权与请求客户端，需 Node.js ≥ 20，用法见其 README 与 [`../Docs`](../Docs) 的 API 参考。每种语言绑定在自己的子目录内自带各自的工程配置，仓库根不放任何语言的 workspace 设置。
+当前已有以下语言绑定，均为 NanaLive 插件 API 的连接、鉴权与请求客户端，用法见各自 README 与 [`../Docs`](../Docs) 的 API 参考：
+
+- [`js/`](./js)（`@nanalive/sdk`）：需 Node.js ≥ 20
+- [`rust/`](./rust)（`nanalive-sdk` crate）：异步运行时为 tokio
+- [`python/`](./python)（`nanalive-sdk` 包，import `nanalive_sdk`）：需 Python ≥ 3.10（asyncio）
+- [`csharp/`](./csharp)（`Nanalive.Sdk`）：需 .NET 8+
+
+每种语言绑定在自己的子目录内自带各自的工程配置，仓库根不放任何语言的 workspace 设置。
 
 ## 本目录不放什么
 
