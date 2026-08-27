@@ -1,0 +1,63 @@
+{
+  "SDKVersion": 2,
+  "Author": "NanaLive",
+  "Name": "NanaLive",
+  "Description": "用 Stream Deck 兼容设备切换 NanaLive 模型、播放动作、触发按键并写入参数。",
+  "URL": "https://github.com/sena-nana/NanaLive",
+  "Version": "0.1.0",
+  "UUID": "com.nanalive.streamdeck",
+  "Icon": "imgs/plugin",
+  "Category": "NanaLive",
+  "CategoryIcon": "imgs/plugin",
+  "CodePath": "plugin.js",
+  "PropertyInspectorPath": "pi/index.html",
+  "Nodejs": {
+    "Version": "20"
+  },
+  "OS": [
+    { "Platform": "windows", "MinimumVersion": "10" },
+    { "Platform": "mac", "MinimumVersion": "10.15" }
+  ],
+  "Software": {
+    "MinimumVersion": "6.5"
+  },
+  "Actions": [
+    {
+      "UUID": "com.nanalive.streamdeck.switch-model",
+      "Name": "切换模型",
+      "Tooltip": "切换当前模型",
+      "Icon": "imgs/plugin",
+      "States": [{ "Image": "imgs/plugin" }]
+    },
+    {
+      "UUID": "com.nanalive.streamdeck.play-motion",
+      "Name": "播放动作",
+      "Tooltip": "播放当前模型的动作",
+      "Icon": "imgs/plugin",
+      "States": [{ "Image": "imgs/plugin" }]
+    },
+    {
+      "UUID": "com.nanalive.streamdeck.trigger-expression",
+      "Name": "触发表情",
+      "Tooltip": "切换当前模型的表情",
+      "Icon": "imgs/plugin",
+      "States": [{ "Image": "imgs/plugin" }]
+    },
+    {
+      "UUID": "com.nanalive.streamdeck.trigger-hotkey",
+      "Name": "触发按键",
+      "Tooltip": "触发当前模型可执行的按键",
+      "Icon": "imgs/plugin",
+      "States": [{ "Image": "imgs/plugin" }]
+    },
+    {
+      "UUID": "com.nanalive.streamdeck.write-parameter",
+      "Name": "写入参数",
+      "Tooltip": "用旋钮或按键写入 Live2D 参数",
+      "Icon": "imgs/plugin",
+      "Controllers": ["Keypad", "Encoder"],
+      "DisableAutomaticStates": true,
+      "States": [{ "Image": "imgs/plugin" }]
+    }
+  ]
+}

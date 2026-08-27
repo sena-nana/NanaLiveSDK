@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>NanaLive</title>
+    <style>
+      body {
+        font: 12px/1.4 sans-serif;
+        margin: 12px;
+        color: #e8e8e8;
+        background: transparent;
+      }
+      label,
+      select,
+      p {
+        display: block;
+        width: 100%;
+      }
+      select {
+        margin: 4px 0 12px;
+      }
+      p {
+        color: #b3b3b3;
+      }
+    </style>
+  </head>
+  <body>
+    <form id="form">
+      <label id="model-field">
+        模型
+        <select id="modelID"></select>
+      </label>
+      <label id="motion-field" hidden>
+        动作
+        <select id="motionID"></select>
+      </label>
+      <label id="expression-field" hidden>
+        表情
+        <select id="expressionID"></select>
+      </label>
+      <label id="hotkey-field" hidden>
+        按键
+        <select id="hotkeyID"></select>
+      </label>
+      <label id="parameter-field" hidden>
+        参数
+        <select id="parameterID"></select>
+      </label>
+      <p id="status">正在读取 NanaLive…</p>
+    </form>
+    <script src="pi.js"></script>
+  </body>
+</html>

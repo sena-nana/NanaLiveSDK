@@ -1,0 +1,14 @@
+{
+  "name": "@nanalive/sdk",
+  "version": "0.1.0",
+  "description": "NanaLive 插件 API 的 JavaScript 客户端绑定",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./index.mjs",
+    "./node-websocket": "./websocket-node.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
