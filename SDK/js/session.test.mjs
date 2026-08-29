@@ -104,7 +104,10 @@ function decodeClientFrame(buffer) {
  * Python/Rust/C# 测试里的 mock 服务端一致。
  */
 function startMockServer(modelsBehavior) {
+  const sockets = new Set();
   const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
     let handshaken = false;
     let index = -1;
     let buffer = Buffer.alloc(0);
@@ -173,7 +176,11 @@ function startMockServer(modelsBehavior) {
     server.listen(0, "127.0.0.1", () => {
       resolve({
         port: server.address().port,
-        close: () => server.close(),
+        close: () => {
+          // 半关闭的 socket 会挂住进程，强制清掉。
+          for (const socket of sockets) socket.destroy();
+          server.close();
+        },
       });
     });
   });

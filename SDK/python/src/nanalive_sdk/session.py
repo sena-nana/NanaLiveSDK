@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import random
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Optional
 
 from .api import (
     DEFAULT_PORT,
@@ -37,7 +37,7 @@ class NanaLiveSession:
     心跳交给 ``websockets`` 的协议级 ping：每 ``heartbeat_interval`` 秒发
     ping，``heartbeat_timeout`` 秒内没收到 pong 就断开并触发重连。
     ``max_retries`` 为 ``None`` 时无限重试；``request_timeout`` 默认 30 秒，
-    传 ``None`` 关闭单请求超时。
+    传 ``None`` 关闭。
     """
 
     def __init__(
@@ -87,8 +87,6 @@ class NanaLiveSession:
         self._status = STATUS_DISCONNECTED
         self._closed = False
         self._supervisor: Optional[asyncio.Task] = None
-        self._attempt = 0
-        self._connect_waiters: List[asyncio.Future] = []
 
     @property
     def client(self) -> NanaLiveClient:
@@ -112,88 +110,106 @@ class NanaLiveSession:
         if self._status == status:
             return
         self._status = status
-        if status == STATUS_CONNECTED:
-            for waiter in self._take_connect_waiters():
-                waiter.set_result(None)
         self._on_status and self._on_status(status)
 
-    def _take_connect_waiters(self) -> List[asyncio.Future]:
-        waiters, self._connect_waiters = self._connect_waiters, []
-        return waiters
-
-    def _fail_connect_waiters(self, error: NanaLiveError) -> None:
-        for waiter in self._take_connect_waiters():
-            if not waiter.done():
-                waiter.set_exception(type(error)())
-
-    def _backoff(self) -> float:
-        base = min(self._retry_delay * 2**self._attempt, self._max_retry_delay)
+    def _backoff(self, attempt: int) -> float:
+        base = min(self._retry_delay * 2 ** (attempt - 1), self._max_retry_delay)
         return max(0.0, base * (1 + 0.2 * (random.random() * 2 - 1)))
 
-    async def connect(self) -> None:
-        """建立会话（含重试），首个连接完成鉴权后返回。
+    # 建立一次连接并完成鉴权；失败时清理半开连接后向上抛。
+    async def _establish(self) -> NanaLiveConnection:
+        connection = await connect(
+            host=self.host,
+            port=self.port,
+            on_unhandled=self._on_unhandled,
+            on_error=self._on_error,
+            client=self._client,
+            ping_interval=self._heartbeat_interval,
+            ping_timeout=self._heartbeat_timeout,
+        )
+        self._connection = connection
+        self._outbound = connection.outbound
+        try:
+            await self._client.authenticate()
+        except Exception:
+            self._connection = None
+            self._outbound = None
+            await _close_quietly(connection)
+            raise
+        self._set_status(STATUS_CONNECTED)
+        return connection
 
-        之后的断线由后台任务自动重连；重复调用是幂等的。
-        重试耗尽（或 ``reconnect=False`` 且连不上）时抛出最后一次错误。
-        """
-        if self._supervisor is None or self._supervisor.done():
-            self._closed = False
-            self._supervisor = asyncio.get_running_loop().create_task(self._run())
-        if self._status == STATUS_CONNECTED:
-            return
-        waiter: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._connect_waiters.append(waiter)
-        await waiter
-
-    async def _run(self) -> None:
-        failure: Optional[NanaLiveError] = None
-        while not self._closed:
-            self._set_status(
-                STATUS_CONNECTING if self._attempt == 0 else STATUS_RECONNECTING
-            )
-            connection: Optional[NanaLiveConnection] = None
-            try:
-                connection = await connect(
-                    host=self.host,
-                    port=self.port,
-                    on_unhandled=self._on_unhandled,
-                    on_error=self._on_error,
-                    client=self._client,
-                    ping_interval=self._heartbeat_interval,
-                    ping_timeout=self._heartbeat_timeout,
-                )
-                self._connection = connection
-                self._outbound = connection.outbound
-                await self._client.authenticate()
-                self._attempt = 0
-                failure = None
-                self._set_status(STATUS_CONNECTED)
-                await connection.closed.wait()
-                self._client.fail_pending(ConnectionLostError())
-            except Exception as exc:
-                failure = (
-                    exc if isinstance(exc, NanaLiveError) else NanaLiveError(str(exc))
-                )
-                self._outbound = None
-                self._connection = None
-                if connection is not None:
-                    await _close_quietly(connection)
-
+    # 断开后的后台重连循环；close() 取消本任务。
+    async def _supervise(self, connection: NanaLiveConnection) -> None:
+        while True:
+            await connection.closed.wait()
+            self._client.fail_pending(ConnectionLostError())
+            self._connection = None
+            self._outbound = None
             if self._closed:
-                break
+                return
             if not self._reconnect:
                 self._set_status(STATUS_DISCONNECTED)
-                self._fail_connect_waiters(failure or ConnectionLostError())
-                break
-            self._attempt += 1
-            if (
-                self._max_retries is not None
-                and self._attempt > self._max_retries
-            ):
-                self._set_status(STATUS_DISCONNECTED)
-                self._fail_connect_waiters(failure or ConnectionLostError())
-                break
-            await asyncio.sleep(self._backoff())
+                return
+            attempt = 0
+            while True:
+                attempt += 1
+                if self._max_retries is not None and attempt > self._max_retries:
+                    self._set_status(STATUS_DISCONNECTED)
+                    return
+                self._set_status(STATUS_RECONNECTING)
+                await asyncio.sleep(self._backoff(attempt))
+                if self._closed:
+                    return
+                try:
+                    connection = await self._establish()
+                    break
+                except Exception:
+                    if self._closed:
+                        return
+
+    async def connect(self) -> None:
+        """建立会话（内联重试直到首个连接完成鉴权）。
+
+        之后的断线由后台任务自动重连；重复调用会重置会话并重新连接。
+        重试耗尽（或 ``reconnect=False`` 且连不上）时抛出最后一次错误。
+        """
+        if self._supervisor is not None and not self._supervisor.done():
+            self._supervisor.cancel()
+            await asyncio.gather(self._supervisor, return_exceptions=True)
+        self._supervisor = None
+        self._closed = False
+        if self._connection is not None:
+            await _close_quietly(self._connection)
+            self._connection = None
+        self._outbound = None
+
+        attempt = 0
+        while True:
+            self._set_status(
+                STATUS_CONNECTING if attempt == 0 else STATUS_RECONNECTING
+            )
+            try:
+                connection = await self._establish()
+            except Exception as exc:
+                attempt += 1
+                if (
+                    self._closed
+                    or not self._reconnect
+                    or (self._max_retries is not None and attempt > self._max_retries)
+                ):
+                    self._set_status(STATUS_DISCONNECTED)
+                    raise (
+                        exc
+                        if isinstance(exc, NanaLiveError)
+                        else NanaLiveError(str(exc))
+                    ) from None
+                await asyncio.sleep(self._backoff(attempt))
+                continue
+            self._supervisor = asyncio.get_running_loop().create_task(
+                self._supervise(connection)
+            )
+            return
 
     async def request(
         self,
@@ -221,7 +237,6 @@ class NanaLiveSession:
         if self._closed:
             return
         self._closed = True
-        self._fail_connect_waiters(NanaLiveError("closed"))
         if self._supervisor is not None:
             self._supervisor.cancel()
             await asyncio.gather(self._supervisor, return_exceptions=True)

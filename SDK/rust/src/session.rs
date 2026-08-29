@@ -176,9 +176,20 @@ impl NanaLiveSession {
         state.generation
     }
 
-    fn set_slot(&self, handle: Option<Arc<ConnectionHandle>>, signal: Option<watch::Sender<u64>>) {
-        *self.slot.write().unwrap() = handle;
+    /// 更新当前连接与断开信号；返回被替换的旧连接（调用方负责关闭）。
+    fn set_slot(
+        &self,
+        handle: Option<Arc<ConnectionHandle>>,
+        signal: Option<watch::Sender<u64>>,
+    ) -> Option<Arc<ConnectionHandle>> {
+        let previous;
+        {
+            let mut slot = self.slot.write().unwrap();
+            previous = slot.take();
+            *slot = handle;
+        }
         *self.disconnected.lock().unwrap() = signal;
+        previous
     }
 
     fn is_closed(&self) -> bool {
@@ -188,10 +199,14 @@ impl NanaLiveSession {
     /// 建立会话（含重试），首个连接完成鉴权后返回。
     ///
     /// 之后的断线由后台任务自动重连；重试耗尽（或 `reconnect = false`
-    /// 且连不上）时返回最后一次的错误。重复调用会重置会话并重新连接。
+    /// 且连不上）时返回最后的错误。重复调用会重置会话并重新连接。
     pub async fn connect(self: &Arc<Self>) -> Result<(), NanaLiveError> {
         self.closed.store(false, Ordering::SeqCst);
-        self.set_slot(None, None);
+        if let Some(previous) = self.set_slot(None, None) {
+            // 重置会话时关闭被替换的旧连接，避免泄漏。
+            previous.close().await;
+            previous.task.abort();
+        }
         let generation = self.next_generation();
 
         let mut attempt: u32 = 0;
