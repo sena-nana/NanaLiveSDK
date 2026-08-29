@@ -39,7 +39,34 @@ const models = await client.listModels();
 
 `identity` 中的 `pluginID` 请使用自己的反向域名标识，`scopes` 只申请实际用到的权限；首次申请的 token 需要用户在 NanaLive 插件页批准。
 
+## 弹性会话（自动重连 + 心跳）
+
+`createNanaLiveSession`（`@nanalive/sdk/session`，仅 Node）在裸连接之上提供完整连接流程：建立 WebSocket → 鉴权 → 心跳保活；断线后挂起中的请求立即失败，按指数退避自动重连并重新鉴权（token 跨重连复用）。
+
+```js
+import { createNanaLiveSession } from "@nanalive/sdk/session";
+
+const session = createNanaLiveSession({
+  identity,
+  onToken: (token) => saveToken(token),
+  onStatus: (status) => console.log(status), // connecting / connected / reconnecting / disconnected
+});
+
+await session.connect(); // 含重试；重试耗尽时抛出最后的错误
+const models = await session.request("AvailableModelsRequest");
+await session.close();
+```
+
+返回对象：`client`、`connect()`、`request(messageType, data)`、`close()`、`status`、`isConnected`。选项（均有默认值）：`host`/`port`/`subprotocol`、`identity`/`token`/`onToken`、`onUnhandled`/`onError`/`onStatus`、`reconnect`（默认 `true`）、`maxRetries`（默认无限）、`retryDelay`/`maxRetryDelay`（500ms/8s）、`heartbeatInterval`/`heartbeatTimeout`（10s/5s）、`connectTimeout`（5s）、`requestTimeout`（30s，`null` 关闭）。
+
 ## 导出
 
 - `.`：协议常量（`API_NAME`、`API_VERSION`、`SUBPROTOCOL`、`DEFAULT_PORT`）、`createNanaLiveClient`，以及 `executableHotkeys`、`parameterValueAfterTicks`、`writeParameterCommand` 等助手。
 - `./node-websocket`：仅 Node 环境可用的极简 WebSocket 客户端（`connectBinaryWebSocket`、`connectTextWebSocket`）。浏览器环境可直接用全局 `WebSocket`。
+- `./session`：仅 Node 环境可用的弹性会话 `createNanaLiveSession`（自动重连、心跳、请求超时）。
+
+## 本地开发
+
+```bash
+npm test   # node --test：session 层集成测试（本地 mock WebSocket 服务端）
+```

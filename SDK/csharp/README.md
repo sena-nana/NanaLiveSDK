@@ -27,6 +27,34 @@ var models = await connection.Client.ListModelsAsync();
 
 `Identity` 的 `PluginId` 请使用自己的反向域名标识，`Scopes` 只申请实际用到的权限；首次申请的 token 经 `OnToken` 回调交付，需要用户在 NanaLive 插件页批准，请在本地持久化并在下次连接时作为 `Token` 传入。
 
+## 弹性会话（自动重连 + 心跳）
+
+`NanaLiveSession` 在裸连接之上提供完整连接流程：建立 WebSocket → 鉴权 → 心跳保活；断线后挂起中的请求立即失败，按指数退避（带抖动）自动重连并重新鉴权（token 跨重连复用）。
+
+```csharp
+await using var session = await NanaLiveSession.ConnectAsync(new SessionOptions
+{
+    Identity = new Identity(
+        "dev.example.my-plugin", "My Plugin", "Example", "0.1.0",
+        ["model.read", "model.switch"]),
+    OnToken = token => SaveToken(token),
+    OnStatus = status => Console.WriteLine(status), // Connecting / Connected / Reconnecting / Disconnected
+});
+
+var models = await session.RequestAsync("AvailableModelsRequest");
+```
+
+成员：`Client`（底层协议客户端，token 跨重连复用）、`ConnectAsync()`（幂等）、
+`RequestAsync(messageType, data)`、`CloseAsync()`（实现 `IAsyncDisposable`）、
+`Status`、`IsConnected`。选项（均有默认值）：`Host`/`Port`、`Identity`/`Token`/`OnToken`、
+`OnUnhandled`/`OnError`/`OnStatus`、`Reconnect`（默认 `true`）、`MaxRetries`（默认无限）、
+`RetryDelay`/`MaxRetryDelay`（500ms/8s）、`HeartbeatInterval`（10s，映射为
+`ClientWebSocket.KeepAliveInterval`，pong 超时由 .NET 运行时内部处理）、
+`RequestTimeout`（30s，`null` 关闭）。
+
+会话未连接时 `RequestAsync` 抛 `NanaLiveConnectionException("not_connected")`；超时抛
+`NanaLiveRequestTimeoutException`；断线时挂起请求以 `NanaLiveConnectionException("connection_lost")` 失败。
+
 ## API 一览
 
 - `NanaLiveConnection.ConnectAsync(...)`：建立 WebSocket 连接，返回
@@ -42,10 +70,11 @@ var models = await connection.Client.ListModelsAsync();
   `Helpers.WriteParameterCommand`。
 - 协议常量：`NanaLiveApi.ApiName / ApiVersion / Subprotocol / DefaultPort`。
 - 异常：`NanaLiveApiException`（`.Code` 对应服务端 `errorCode`）及其
-  `AuthenticationTokenMissingException`。
+  `AuthenticationTokenMissingException`；连接层错误 `NanaLiveConnectionException`
+  与 `NanaLiveRequestTimeoutException`。
 
-SDK 本身不做自动重连与心跳；断线后请自行重建连接并重新 `AuthenticateAsync()`
-（旧 token 仍有效时会直接验证通过）。
+裸连接（`NanaLiveConnection.ConnectAsync(...)`）只负责建立连接与泵任务；自动重连、
+心跳与请求超时请使用 `NanaLiveSession`。
 
 ## 本地开发
 

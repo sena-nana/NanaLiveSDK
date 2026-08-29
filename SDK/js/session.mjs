@@ -1,6 +1,11 @@
 import { createNanaLiveClient, DEFAULT_PORT, SUBPROTOCOL } from "./api.mjs";
 import { connectBinaryWebSocket } from "./websocket-node.mjs";
 
+const SESSION_CONNECTING = "connecting";
+const SESSION_CONNECTED = "connected";
+const SESSION_RECONNECTING = "reconnecting";
+const SESSION_DISCONNECTED = "disconnected";
+
 /**
  * 带自动重连、心跳与请求超时的会话层。
  *
@@ -221,6 +226,7 @@ export function createNanaLiveSession(options = {}) {
       } catch {
         // 忽略关闭失败。
       }
+      currentSocket = null;
     }
     client.failPending(new Error("connection_lost"));
     failConnectWaiters(new Error("closed"));

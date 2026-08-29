@@ -39,6 +39,34 @@ asyncio.run(main())
 
 `identity` 中的 `pluginID` 请使用自己的反向域名标识，`scopes` 只申请实际用到的权限；首次申请的 token 经 `on_token` 回调交付，需要用户在 NanaLive 插件页批准，请在本地持久化并在下次连接时作为 `token` 参数传入。
 
+## 弹性会话（自动重连 + 心跳）
+
+`NanaLiveSession`（`nanalive_sdk.session`）在裸连接之上提供完整连接流程：建立 WebSocket → 鉴权 → 心跳保活；断线后挂起中的请求立即失败，按指数退避（带抖动）自动重连并重新鉴权（token 跨重连复用）。
+
+```python
+from nanalive_sdk import NanaLiveSession, DEFAULT_PORT
+
+session = NanaLiveSession(
+    port=DEFAULT_PORT,
+    identity={...},
+    on_token=save_token,
+    on_status=lambda status: print(status),  # connecting / connected / reconnecting / disconnected
+)
+await session.connect()  # 含重试；之后的断线由后台任务自动重连
+models = await session.request("AvailableModelsRequest")
+await session.close()
+```
+
+属性与方法：`client`（底层协议客户端，token 跨重连复用）、`connect()`（幂等）、
+`request(message_type, data)`、`close()`、`status`、`connected`。选项（均有默认值）：
+`host`/`port`、`identity`/`token`/`on_token`、`on_unhandled`/`on_error`/`on_status`、
+`reconnect`（默认 `True`）、`max_retries`（默认无限）、`retry_delay`/`max_retry_delay`
+（0.5s/8s）、`heartbeat_interval`/`heartbeat_timeout`（10s/5s，透传给 `websockets`
+的协议级 ping）、`request_timeout`（30s，`None` 关闭）。
+
+会话未连接时 `request` 抛 `NotConnectedError`；超时抛 `RequestTimeoutError`；
+断线时挂起请求以 `ConnectionLostError` 失败。
+
 ## API 一览
 
 - `connect(...)`（`nanalive_sdk.connection`）：建立 WebSocket 连接，返回
@@ -52,10 +80,10 @@ asyncio.run(main())
   `write_parameter_command`。
 - 协议常量：`API_NAME`、`API_VERSION`、`SUBPROTOCOL`、`DEFAULT_PORT`。
 - 异常：`NanaLiveError`（`.code` 对应服务端 `errorCode`）及其子类
-  `AuthenticationTokenMissingError`。
+  `AuthenticationTokenMissingError`、`NotConnectedError`、`ConnectionLostError`、
+  `RequestTimeoutError`。
 
-SDK 本身不做自动重连与心跳；断线后请自行重建连接并重新 `authenticate()`
-（旧 token 仍有效时会直接验证通过）。
+裸连接（`connect(...)`）只负责建立连接与泵任务；自动重连、心跳与请求超时请使用 `NanaLiveSession`。
 
 ## 本地开发
 

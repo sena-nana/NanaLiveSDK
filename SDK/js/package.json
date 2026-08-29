@@ -4,6 +4,9 @@
   "description": "NanaLive 插件 API 的 JavaScript 客户端绑定",
   "license": "MIT",
   "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
   "exports": {
     ".": "./index.mjs",
     "./node-websocket": "./websocket-node.mjs",

@@ -27,6 +27,28 @@
 - `parameterValueAfterTicks(parameter, ticks)`：按旋钮刻度计算参数目标值
 - `writeParameterCommand(parameterID, value)`：构造 `ParameterWriteRequest`
 
+### 会话层（`@nanalive/sdk/session`，仅 Node）
+
+`createNanaLiveSession(...)` 在裸连接之上提供完整连接流程：建立 WebSocket → 鉴权（优先复用已有 token）→ 心跳保活。断线后挂起中的请求立即以 `connection_lost` 失败，并按指数退避（带抖动）自动重连与重新鉴权（token 跨重连复用）；通过 `onStatus` 回调观察 `connecting` / `connected` / `reconnecting` / `disconnected` 状态。
+
+```js
+import { createNanaLiveSession } from "@nanalive/sdk/session";
+
+const session = createNanaLiveSession({
+  identity,
+  onToken: (token) => saveToken(token),
+  onStatus: (status) => console.log(status),
+});
+
+await session.connect(); // 含重试；重试耗尽时抛出最后的错误
+const models = await session.request("AvailableModelsRequest");
+await session.close();
+```
+
+返回对象：`client`（底层协议客户端）、`connect()`（幂等，重复调用会重置会话）、`request(messageType, data)`、`close()`、`status`、`isConnected`。
+
+选项（均有默认值）：`host` / `port` / `subprotocol`、`identity` / `token` / `onToken`、`onUnhandled` / `onError` / `onStatus`、`reconnect`（默认 `true`）、`maxRetries`（默认无限）、`retryDelay` / `maxRetryDelay`（500ms / 8s）、`heartbeatInterval` / `heartbeatTimeout`（10s / 5s，空闲超间隔发 WebSocket ping，超时内无任何入站帧即视为死链）、`connectTimeout`（5s）、`requestTimeout`（30s，`null` 关闭）。
+
 ### 连接
 
 - `@nanalive/sdk/node-websocket` 导出 `connectBinaryWebSocket` / `connectTextWebSocket`（仅 Node 环境）；浏览器环境直接用全局 `WebSocket`。
@@ -82,13 +104,36 @@ finally:
     await connection.close()
 ```
 
-注意：
+### 会话层（自动重连 + 心跳）
 
-- 各绑定都不做自动重连与心跳，断线后请重建连接并重新 `authenticate()`
-  （旧 token 仍有效时会直接验证通过）。
-- 未配对的响应（服务器主动推送）会透传给调用方：Rust 的 `on_unhandled`
-  回调 / `receive` 返回值、Python 的 `on_unhandled` 回调 / `receive` 返回值、
-  C# 的 `OnUnhandled` 事件 / `Receive` 返回值、JS 的 `receive` 返回值。
+四个绑定都提供同语义的弹性会话：Rust 的 `NanaLiveSession`（`session` 模块）、
+Python 的 `NanaLiveSession`（`nanalive_sdk.session`）、C# 的 `NanaLiveSession`，
+选项与 JS 的 `createNanaLiveSession` 一致（`max_retries`、`retry_delay`、
+`heartbeat_interval`、`request_timeout`、`on_status` 等）。以 Python 为例：
+
+```python
+from nanalive_sdk import NanaLiveSession
+
+session = NanaLiveSession(
+    port=DEFAULT_PORT,
+    identity={...},
+    on_token=save_token,
+    on_status=lambda status: print(status),
+)
+await session.connect()  # 含重试；之后的断线由后台任务自动重连
+models = await session.request("AvailableModelsRequest")
+await session.close()
+```
+
+会话未连接时 `request` 立刻失败（`NotConnectedError` / `NanaLiveError("not_connected")` /
+`NanaLiveConnectionException` / `NanaLiveError::NotConnected`），超时失败为
+`RequestTimeoutError` / `NanaLiveError::RequestTimeout` / `NanaLiveRequestTimeoutException`。
+差异：C# 的心跳映射为 `ClientWebSocket.KeepAliveInterval`，pong 超时由 .NET 运行时内部处理，
+故没有独立的 `heartbeat_timeout` 选项。
+
+注意：未配对的响应（服务器主动推送）仍会透传给调用方：Rust 的 `on_unhandled`
+回调 / `receive` 返回值、Python 的 `on_unhandled` 回调 / `receive` 返回值、
+C# 的 `OnUnhandled` 事件 / `Receive` 返回值、JS 的 `onUnhandled` 回调 / `receive` 返回值。
 
 ## 其他
 
