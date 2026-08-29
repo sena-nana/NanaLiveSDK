@@ -21,3 +21,21 @@ public sealed class AuthenticationTokenMissingException : Exception
     {
     }
 }
+
+/// <summary>连接层错误：未连接发起请求、断线后挂起请求失败等。</summary>
+public class NanaLiveConnectionException : Exception
+{
+    public NanaLiveConnectionException(string message)
+        : base(message)
+    {
+    }
+}
+
+/// <summary>请求在超时时间内没有等到响应。</summary>
+public sealed class NanaLiveRequestTimeoutException : NanaLiveConnectionException
+{
+    public NanaLiveRequestTimeoutException()
+        : base("request_timeout")
+    {
+    }
+}

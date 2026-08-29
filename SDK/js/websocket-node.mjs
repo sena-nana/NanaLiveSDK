@@ -16,7 +16,9 @@ function connectWebSocket({
   onMessage,
   onClose,
   onError,
+  onPong,
   binary = false,
+  timeout = null,
 }) {
   return new Promise((resolve, reject) => {
     const socket = net.connect({ host, port });
@@ -24,6 +26,7 @@ function connectWebSocket({
     let handshake = true;
     let settled = false;
     let buffer = Buffer.alloc(0);
+    let timer = null;
 
     function fail(error) {
       if (!settled) {
@@ -32,6 +35,11 @@ function connectWebSocket({
       }
       onError?.(error);
       socket.destroy();
+    }
+
+    if (timeout !== null) {
+      timer = setTimeout(() => fail(new Error("connect_timeout")), timeout);
+      socket.once("close", () => clearTimeout(timer));
     }
 
     socket.on("connect", () => {
@@ -63,6 +71,7 @@ function connectWebSocket({
         handshake = false;
         if (!settled) {
           settled = true;
+          if (timer !== null) clearTimeout(timer);
           resolve({
             send(payload) {
               const data = binary
@@ -71,6 +80,9 @@ function connectWebSocket({
                   : Buffer.from(payload)
                 : Buffer.from(String(payload), "utf8");
               socket.write(encodeFrame(binary ? 2 : 1, data));
+            },
+            ping() {
+              socket.write(encodeFrame(9, Buffer.alloc(0)));
             },
             close() {
               socket.end();
@@ -84,11 +96,12 @@ function connectWebSocket({
         buffer = frame.rest;
         if (frame.opcode === 1 && !binary) onMessage?.(frame.payload.toString("utf8"));
         if (frame.opcode === 2 && binary) onMessage?.(frame.payload);
+        if (frame.opcode === 9) socket.write(encodeFrame(10, frame.payload));
+        if (frame.opcode === 10) onPong?.(frame.payload);
         if (frame.opcode === 8) {
           onClose?.();
           socket.end();
         }
-        if (frame.opcode === 9) socket.write(encodeFrame(10, frame.payload));
       }
     });
 

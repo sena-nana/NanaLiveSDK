@@ -45,7 +45,19 @@ public sealed class NanaLiveClient
             ("requestID", Mp.Str(requestId)),
             ("messageType", Mp.Str(messageType)),
             ("data", data ?? Mp.Map()));
-        _send(Mp.Serialize(envelope));
+        try
+        {
+            _send(Mp.Serialize(envelope));
+        }
+        catch (Exception error)
+        {
+            lock (_gate)
+            {
+                _waiters.Remove(requestId);
+            }
+            completion.TrySetException(error);
+            throw;
+        }
         return completion.Task;
     }
 
@@ -93,6 +105,24 @@ public sealed class NanaLiveClient
         }
 
         return null;
+    }
+
+    /// <summary>让所有等待中的请求立即失败（连接断开时由会话层调用）。</summary>
+    /// <returns>清掉的等待者数量。</returns>
+    public int FailPending(Exception error)
+    {
+        TaskCompletionSource<object?>[] pending;
+        lock (_gate)
+        {
+            pending = _waiters.Values.ToArray();
+            _waiters.Clear();
+        }
+
+        foreach (var waiter in pending)
+        {
+            waiter.TrySetException(error);
+        }
+        return pending.Length;
     }
 
     /// <summary>两段式鉴权：已有 token 先尝试验证，失败降级为申请新 token。</summary>

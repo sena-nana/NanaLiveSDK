@@ -18,6 +18,10 @@ pub enum NanaLiveError {
     Connect(String),
     /// 连接在请求等待期间关闭或出错。
     ConnectionClosed(String),
+    /// 会话未连接时发起请求。
+    NotConnected,
+    /// 请求在超时时间内没有等到响应。
+    RequestTimeout,
 }
 
 impl NanaLiveError {
@@ -46,6 +50,8 @@ impl fmt::Display for NanaLiveError {
             NanaLiveError::ConnectionClosed(message) => {
                 write!(f, "connection_closed: {message}")
             }
+            NanaLiveError::NotConnected => write!(f, "not_connected"),
+            NanaLiveError::RequestTimeout => write!(f, "request_timeout"),
         }
     }
 }

@@ -149,6 +149,18 @@ impl NanaLiveClient {
         None
     }
 
+    /// 让所有等待中的请求立即失败（连接断开时由会话层调用）。
+    ///
+    /// 返回清掉的等待者数量。
+    pub fn fail_pending(&self, error: NanaLiveError) -> usize {
+        let mut waiters = self.waiters.lock().unwrap();
+        let count = waiters.len();
+        for (_, sender) in waiters.drain() {
+            let _ = sender.send(Err(error.clone()));
+        }
+        count
+    }
+
     /// 两段式鉴权：已有 token 先尝试验证，失败降级为申请新 token。
     pub async fn authenticate(&self) -> Result<Value, NanaLiveError> {
         // 先克隆出锁再进入 await，避免 MutexGuard 跨 await。

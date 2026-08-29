@@ -46,16 +46,30 @@ export function createNanaLiveClient({ send, identity = null, token = null, onTo
     const result = new Promise((resolve, reject) => {
       waiters.set(requestID, { resolve, reject });
     });
-    send(
-      encode({
-        apiName: API_NAME,
-        apiVersion: API_VERSION,
-        requestID,
-        messageType,
-        data,
-      }),
-    );
+    try {
+      send(
+        encode({
+          apiName: API_NAME,
+          apiVersion: API_VERSION,
+          requestID,
+          messageType,
+          data,
+        }),
+      );
+    } catch (error) {
+      waiters.delete(requestID);
+      throw error;
+    }
     return result;
+  }
+
+  function failPending(error) {
+    const pending = [...waiters.values()];
+    waiters.clear();
+    for (const waiter of pending) {
+      waiter.reject(error);
+    }
+    return pending.length;
   }
 
   function receive(raw) {
@@ -95,6 +109,7 @@ export function createNanaLiveClient({ send, identity = null, token = null, onTo
     receive,
     request,
     authenticate,
+    failPending,
     listModels: () => request("AvailableModelsRequest"),
     listMotions: () => request("MotionListRequest"),
     listExpressions: () => request("ExpressionListRequest"),

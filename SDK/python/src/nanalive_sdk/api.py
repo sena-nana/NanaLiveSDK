@@ -37,6 +37,27 @@ class AuthenticationTokenMissingError(NanaLiveError):
         super().__init__("authentication_token_missing")
 
 
+class NotConnectedError(NanaLiveError):
+    """会话未连接时发起请求。"""
+
+    def __init__(self) -> None:
+        super().__init__("not_connected")
+
+
+class ConnectionLostError(NanaLiveError):
+    """连接在请求等待期间断开。"""
+
+    def __init__(self) -> None:
+        super().__init__("connection_lost")
+
+
+class RequestTimeoutError(NanaLiveError):
+    """请求在超时时间内没有等到响应。"""
+
+    def __init__(self) -> None:
+        super().__init__("request_timeout")
+
+
 def _number(value: Any) -> float:
     """按 JS ``Number`` 的宽松语义转浮点，失败得 NaN。"""
     if value is None:
@@ -136,7 +157,11 @@ class NanaLiveClient:
             "messageType": message_type,
             "data": {} if data is _UNSET else data,
         }
-        self._send(msgpack.packb(envelope, use_bin_type=True))
+        try:
+            self._send(msgpack.packb(envelope, use_bin_type=True))
+        except Exception:
+            self._waiters.pop(request_id, None)
+            raise
         return await future
 
     def receive(self, raw: Any) -> Optional[Any]:
@@ -163,6 +188,19 @@ class NanaLiveClient:
         else:
             future.set_result(response)
         return None
+
+    def fail_pending(self, error: Optional[NanaLiveError] = None) -> int:
+        """让所有等待中的请求立即失败（连接断开时由会话层调用）。
+
+        返回清掉的等待者数量。
+        """
+        waiters = list(self._waiters.values())
+        self._waiters.clear()
+        failure = error or ConnectionLostError()
+        for future in waiters:
+            if not future.done():
+                future.set_exception(failure)
+        return len(waiters)
 
     async def authenticate(self) -> Dict[str, Any]:
         """两段式鉴权：已有 token 先尝试验证，失败降级为申请新 token。"""

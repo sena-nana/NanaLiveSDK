@@ -2,6 +2,7 @@
 //! `connectBinaryWebSocket` 用法（子协议 + 二进制 MessagePack 帧）。
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use rmpv::Value;
@@ -18,6 +19,10 @@ use crate::{DEFAULT_PORT, SUBPROTOCOL};
 
 pub type UnhandledCallback = Arc<dyn Fn(Value) + Send + Sync>;
 pub type ErrorCallback = Arc<dyn Fn(String) + Send + Sync>;
+/// 收到任意入站帧（数据/ping/pong）时触发，会话层用它做活动时间戳。
+pub type ActivityCallback = Arc<dyn Fn() + Send + Sync>;
+/// 泵任务退出（连接断开）时触发，会话层据此发起重连。
+pub type DisconnectCallback = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Clone, Default)]
 pub struct ConnectOptions {
@@ -33,6 +38,10 @@ pub struct ConnectOptions {
     pub on_unhandled: Option<UnhandledCallback>,
     /// 泵任务中的协议/连接错误。
     pub on_error: Option<ErrorCallback>,
+    /// 收到任意入站帧时的活动回调。
+    pub on_activity: Option<ActivityCallback>,
+    /// 泵任务退出（连接断开）时的回调。
+    pub on_disconnect: Option<DisconnectCallback>,
 }
 
 impl ConnectOptions {
@@ -45,6 +54,8 @@ impl ConnectOptions {
             on_token: None,
             on_unhandled: None,
             on_error: None,
+            on_activity: None,
+            on_disconnect: None,
         }
     }
 }
@@ -62,6 +73,16 @@ impl ConnectionHandle {
         let _ = self.outbound.send(Message::Close(None));
     }
 
+    /// 通过出站通道发送一条原始 WebSocket 消息，返回是否入队成功。
+    pub fn send_raw(&self, message: Message) -> bool {
+        self.outbound.send(message).is_ok()
+    }
+
+    /// 发送一条 WebSocket ping（会话层心跳）。
+    pub fn ping(&self) -> bool {
+        self.send_raw(Message::Ping(Vec::new()))
+    }
+
     pub fn into_parts(self) -> (Arc<NanaLiveClient>, JoinHandle<()>) {
         (self.client, self.task)
     }
@@ -72,6 +93,40 @@ impl ConnectionHandle {
 /// 泵任务把入站 MessagePack 帧喂给 [`NanaLiveClient::receive`]，
 /// 客户端的 `send` 回调经出站通道写回 WebSocket。
 pub async fn connect(options: ConnectOptions) -> Result<ConnectionHandle, NanaLiveError> {
+    let ConnectOptions {
+        identity,
+        token,
+        on_token,
+        ..
+    } = options.clone();
+    let (outbound, outbound_rx) = mpsc::unbounded_channel::<Message>();
+    let outbound_for_send = outbound.clone();
+    let client = Arc::new(NanaLiveClient::new(
+        move |bytes: Vec<u8>| {
+            let _ = outbound_for_send.send(Message::Binary(bytes));
+        },
+        identity,
+        token,
+        on_token,
+    ));
+    establish_connection(options, client, outbound, outbound_rx).await
+}
+
+/// 同 [`connect`]，但复用调用方提供的客户端（会话层跨重连共享 token 与等待队列）。
+pub async fn connect_with_client(
+    options: ConnectOptions,
+    client: Arc<NanaLiveClient>,
+) -> Result<ConnectionHandle, NanaLiveError> {
+    let (outbound, outbound_rx) = mpsc::unbounded_channel::<Message>();
+    establish_connection(options, client, outbound, outbound_rx).await
+}
+
+async fn establish_connection(
+    options: ConnectOptions,
+    client: Arc<NanaLiveClient>,
+    outbound: mpsc::UnboundedSender<Message>,
+    mut outbound_rx: mpsc::UnboundedReceiver<Message>,
+) -> Result<ConnectionHandle, NanaLiveError> {
     let url = format!("ws://{}:{}/", options.host, options.port);
     let mut request = url
         .into_client_request()
@@ -85,40 +140,44 @@ pub async fn connect(options: ConnectOptions) -> Result<ConnectionHandle, NanaLi
         .map_err(|error| NanaLiveError::Connect(error.to_string()))?;
     let (mut sink, mut stream) = websocket.split();
 
-    let (outbound, mut outbound_rx) = mpsc::unbounded_channel::<Message>();
-    let outbound_for_send = outbound.clone();
-    let client = Arc::new(NanaLiveClient::new(
-        move |bytes: Vec<u8>| {
-            let _ = outbound_for_send.send(Message::Binary(bytes));
-        },
-        options.identity,
-        options.token,
-        options.on_token,
-    ));
-
     let pump_client = Arc::clone(&client);
     let on_unhandled = options.on_unhandled;
     let on_error = options.on_error;
+    let on_activity = options.on_activity;
+    let on_disconnect = options.on_disconnect;
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
                 inbound = stream.next() => match inbound {
-                    Some(Ok(Message::Binary(payload))) => match pump_client.receive(&payload) {
-                        Ok(Some(value)) => {
-                            if let Some(on_unhandled) = &on_unhandled {
-                                on_unhandled(value);
+                    Some(Ok(Message::Binary(payload))) => {
+                        if let Some(on_activity) = &on_activity {
+                            on_activity();
+                        }
+                        match pump_client.receive(&payload) {
+                            Ok(Some(value)) => {
+                                if let Some(on_unhandled) = &on_unhandled {
+                                    on_unhandled(value);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                if let Some(on_error) = &on_error {
+                                    on_error(error.to_string());
+                                }
                             }
                         }
-                        Ok(None) => {}
-                        Err(error) => {
-                            if let Some(on_error) = &on_error {
-                                on_error(error.to_string());
-                            }
-                        }
-                    },
-                    // tungstenite 不会自动回 Pong，这里显式回应。
+                    }
                     Some(Ok(Message::Ping(payload))) => {
+                        if let Some(on_activity) = &on_activity {
+                            on_activity();
+                        }
+                        // tungstenite 不会自动回 Pong，这里显式回应。
                         let _ = sink.send(Message::Pong(payload)).await;
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        if let Some(on_activity) = &on_activity {
+                            on_activity();
+                        }
                     }
                     Some(Ok(Message::Close(frame))) => {
                         let _ = sink.send(Message::Close(frame)).await;
@@ -154,6 +213,9 @@ pub async fn connect(options: ConnectOptions) -> Result<ConnectionHandle, NanaLi
                 },
             }
         }
+        if let Some(on_disconnect) = &on_disconnect {
+            on_disconnect();
+        }
     });
 
     Ok(ConnectionHandle {
@@ -161,4 +223,12 @@ pub async fn connect(options: ConnectOptions) -> Result<ConnectionHandle, NanaLi
         task,
         outbound,
     })
+}
+
+/// 当前 UNIX 时间（毫秒），会话层用它记录活动时间戳。
+pub(crate) fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }

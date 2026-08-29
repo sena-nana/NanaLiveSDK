@@ -11,13 +11,17 @@ from .api import (
     DEFAULT_PORT,
     SUBPROTOCOL,
     AuthenticationTokenMissingError,
+    ConnectionLostError,
     NanaLiveClient,
     NanaLiveError,
+    NotConnectedError,
+    RequestTimeoutError,
     executable_hotkeys,
     parameter_value_after_ticks,
     write_parameter_command,
 )
 from .connection import NanaLiveConnection, connect
+from .session import NanaLiveSession
 
 __all__ = [
     "API_NAME",
@@ -25,9 +29,13 @@ __all__ = [
     "DEFAULT_PORT",
     "SUBPROTOCOL",
     "AuthenticationTokenMissingError",
+    "ConnectionLostError",
     "NanaLiveClient",
     "NanaLiveConnection",
     "NanaLiveError",
+    "NanaLiveSession",
+    "NotConnectedError",
+    "RequestTimeoutError",
     "connect",
     "executable_hotkeys",
     "parameter_value_after_ticks",

@@ -3,7 +3,7 @@ using System.Threading.Channels;
 
 namespace Nanalive.Sdk;
 
-/// <summary><see cref="ConnectAsync"/> 的选项。</summary>
+/// <summary><see cref="NanaLiveConnection.ConnectAsync"/> 的选项。</summary>
 public sealed class ConnectOptions
 {
     /// <summary>默认 <c>127.0.0.1</c>。</summary>
@@ -24,6 +24,12 @@ public sealed class ConnectOptions
 
     /// <summary>泵任务中的协议/连接错误。</summary>
     public Action<string>? OnError { get; set; }
+
+    /// <summary>
+    /// WebSocket 协议级心跳间隔（<see cref="ClientWebSocket.Options.KeepAliveInterval"/>）。
+    /// <c>null</c> 时沿用 BCL 默认值（30 秒）；会话层会把它设为心跳间隔。
+    /// </summary>
+    public TimeSpan? KeepAliveInterval { get; set; }
 }
 
 /// <summary>基于 BCL <see cref="ClientWebSocket"/> 的连接：客户端 + 后台收发泵任务。</summary>
@@ -35,6 +41,12 @@ public sealed class NanaLiveConnection : IAsyncDisposable
     private readonly Task _sendLoop;
 
     public NanaLiveClient Client { get; }
+
+    /// <summary>泵任务全部退出后完成（正常关闭与断线都会触发）。</summary>
+    public Task Completion { get; }
+
+    /// <summary>出站通道；会话层把它绑定到共享客户端的 send 回调。</summary>
+    internal ChannelWriter<byte[]> Outbound => _outbound.Writer;
 
     private NanaLiveConnection(
         ClientWebSocket webSocket,
@@ -48,6 +60,7 @@ public sealed class NanaLiveConnection : IAsyncDisposable
         _outbound = outbound;
         _receiveLoop = receiveLoop;
         _sendLoop = sendLoop;
+        Completion = Task.WhenAll(receiveLoop, sendLoop);
     }
 
     /// <summary>连接 NanaLive 控制 API。</summary>
@@ -59,11 +72,6 @@ public sealed class NanaLiveConnection : IAsyncDisposable
         ConnectOptions? options = null, CancellationToken cancellationToken = default)
     {
         options ??= new ConnectOptions();
-        var webSocket = new ClientWebSocket();
-        webSocket.Options.AddSubProtocol(NanaLiveApi.Subprotocol);
-        await webSocket.ConnectAsync(
-            new Uri($"ws://{options.Host}:{options.Port}/"), cancellationToken);
-
         var outbound = Channel.CreateUnbounded<byte[]>(
             new UnboundedChannelOptions { SingleReader = true });
         var client = new NanaLiveClient(
@@ -71,9 +79,38 @@ public sealed class NanaLiveConnection : IAsyncDisposable
             options.Identity,
             options.Token,
             options.OnToken);
+        return await ConnectAsync(options, client, outbound, cancellationToken);
+    }
+
+    /// <summary>
+    /// 同 <see cref="ConnectAsync(ConnectOptions?, CancellationToken)"/>，
+    /// 但复用调用方提供的客户端（会话层跨重连共享 token 与等待队列）。
+    /// </summary>
+    public static Task<NanaLiveConnection> ConnectAsync(
+        ConnectOptions options, NanaLiveClient client, CancellationToken cancellationToken = default)
+    {
+        var outbound = Channel.CreateUnbounded<byte[]>(
+            new UnboundedChannelOptions { SingleReader = true });
+        return ConnectAsync(options, client, outbound, cancellationToken);
+    }
+
+    private static async Task<NanaLiveConnection> ConnectAsync(
+        ConnectOptions options,
+        NanaLiveClient client,
+        Channel<byte[]> outbound,
+        CancellationToken cancellationToken)
+    {
+        var webSocket = new ClientWebSocket();
+        if (options.KeepAliveInterval is { } keepAlive)
+        {
+            webSocket.Options.KeepAliveInterval = keepAlive;
+        }
+        webSocket.Options.AddSubProtocol(NanaLiveApi.Subprotocol);
+        await webSocket.ConnectAsync(
+            new Uri($"ws://{options.Host}:{options.Port}/"), cancellationToken);
 
         var receiveLoop = Task.Run(
-            () => ReceiveLoopAsync(webSocket, client, options.OnUnhandled, options.OnError));
+            () => ReceiveLoopAsync(webSocket, client, outbound.Writer, options.OnUnhandled, options.OnError));
         var sendLoop = Task.Run(() => SendLoopAsync(webSocket, outbound.Reader));
         return new NanaLiveConnection(webSocket, client, outbound, receiveLoop, sendLoop);
     }
@@ -90,7 +127,7 @@ public sealed class NanaLiveConnection : IAsyncDisposable
 
         try
         {
-            await Task.WhenAll(_receiveLoop, _sendLoop);
+            await Completion;
         }
         catch (Exception)
         {
@@ -101,6 +138,25 @@ public sealed class NanaLiveConnection : IAsyncDisposable
     public async ValueTask DisposeAsync() => await CloseAsync();
 
     private static async Task ReceiveLoopAsync(
+        ClientWebSocket webSocket,
+        NanaLiveClient client,
+        ChannelWriter<byte[]> outbound,
+        Action<object?>? onUnhandled,
+        Action<string>? onError)
+    {
+        try
+        {
+            await ReceiveMessagesAsync(webSocket, client, onUnhandled, onError);
+        }
+        finally
+        {
+            // 接收泵退出即连接结束；关闭出站通道让发送泵也随之退出，
+            // 否则意外断线时 Completion（WhenAll）永远等不到发送泵。
+            outbound.TryComplete();
+        }
+    }
+
+    private static async Task ReceiveMessagesAsync(
         ClientWebSocket webSocket,
         NanaLiveClient client,
         Action<object?>? onUnhandled,
