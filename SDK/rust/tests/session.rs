@@ -61,6 +61,10 @@ enum ModelsBehavior {
     DropWithoutAnswer,
     /// 不回答也不断开，用于请求超时测试。
     SilentOnModels,
+    /// 第一次回答前先拖 400ms（比客户端超时晚），之后正常回答。
+    DelayFirstModels,
+    /// `AuthenticationTokenRequest` 先拖 500ms 再回答（留出 close 窗口）。
+    SlowAuth,
 }
 
 /// 返回 (requestID, messageType, 响应类型, 响应数据)。
@@ -82,11 +86,19 @@ fn route(request: &Value) -> Option<(String, String, String, Value)> {
     Some((request_id, message_type, response_type.to_string(), data))
 }
 
+/// mock 服务端句柄：地址 + 连接计数（供重连测试断言）。
+struct MockServer {
+    addr: SocketAddr,
+    connections: Arc<AtomicUsize>,
+}
+
 /// 本地 mock 服务端：循环接受多条连接（会话层重连会用）。
-async fn spawn_mock_server(models_behavior: ModelsBehavior) -> SocketAddr {
+async fn spawn_mock_server(models_behavior: ModelsBehavior) -> MockServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let counter = Arc::new(AtomicUsize::new(0));
+    let connections = Arc::new(AtomicUsize::new(0));
+    let connections_for_task = Arc::clone(&connections);
     tokio::spawn(async move {
         loop {
             let (stream, _) = match listener.accept().await {
@@ -94,6 +106,8 @@ async fn spawn_mock_server(models_behavior: ModelsBehavior) -> SocketAddr {
                 Err(_) => return,
             };
             let index = counter.fetch_add(1, Ordering::SeqCst);
+            let connections = Arc::clone(&connections_for_task);
+            connections.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
                 let callback = move |request: &Request<()>, mut response: Response<()>| {
                     if let Some(protocol) = request
@@ -112,13 +126,25 @@ async fn spawn_mock_server(models_behavior: ModelsBehavior) -> SocketAddr {
                     Ok(websocket) => websocket,
                     Err(_) => return,
                 };
+                let mut delayed_models = false;
                 while let Some(Ok(message)) = websocket.next().await {
                     let Message::Binary(payload) = message else {
                         continue;
                     };
                     let request = decode(&payload);
-                    let Some((request_id, message_type, response_type, data)) =
-                        route(&request)
+                    if request.get("messageType").and_then(Value::as_str) == Some("AuthenticationTokenRequest")
+                        && models_behavior == ModelsBehavior::SlowAuth
+                    {
+                        // 慢鉴权：拖过 close() 的窗口后再回答。
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        let Some((request_id, _, response_type, data)) = route(&request) else {
+                            continue;
+                        };
+                        let response = envelope(&request_id, &response_type, data);
+                        let _ = websocket.send(Message::Binary(encode(&response))).await;
+                        continue;
+                    }
+                    let Some((request_id, message_type, response_type, data)) = route(&request)
                     else {
                         continue;
                     };
@@ -140,6 +166,21 @@ async fn spawn_mock_server(models_behavior: ModelsBehavior) -> SocketAddr {
                                 return;
                             }
                             ModelsBehavior::SilentOnModels => continue,
+                            ModelsBehavior::DelayFirstModels => {}
+                            ModelsBehavior::SlowAuth => {}
+                        }
+                        // 第一条连接上把第一次回答拖到客户端超时之后。
+                        if models_behavior == ModelsBehavior::DelayFirstModels
+                            && index == 0
+                            && !delayed_models
+                        {
+                            delayed_models = true;
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                            let response = envelope(&request_id, &response_type, data);
+                            let _ = websocket
+                                .send(Message::Binary(encode(&response)))
+                                .await;
+                            continue;
                         }
                     }
                     let response = envelope(&request_id, &response_type, data);
@@ -154,7 +195,7 @@ async fn spawn_mock_server(models_behavior: ModelsBehavior) -> SocketAddr {
             });
         }
     });
-    addr
+    MockServer { addr, connections }
 }
 
 fn session_options(addr: SocketAddr, request_timeout: Option<Duration>) -> SessionOptions {
@@ -187,15 +228,19 @@ fn assert_models(response: &Value) {
 
 #[tokio::test]
 async fn session_reconnects_after_server_drop() {
-    let addr = spawn_mock_server(ModelsBehavior::AnswerThenDropFirst).await;
+    let server = spawn_mock_server(ModelsBehavior::AnswerThenDropFirst).await;
+    let addr = server.addr;
     let statuses = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&statuses);
-    let session = Arc::new(NanaLiveSession::new(SessionOptions {
-        on_status: Some(Arc::new(move |status| {
-            captured.lock().unwrap().push(status);
-        })),
-        ..session_options(addr, Some(Duration::from_secs(5)))
-    }));
+    let session = Arc::new(
+        NanaLiveSession::new(SessionOptions {
+            on_status: Some(Arc::new(move |status| {
+                captured.lock().unwrap().push(status);
+            })),
+            ..session_options(addr, Some(Duration::from_secs(5)))
+        })
+        .unwrap(),
+    );
 
     session.connect().await.unwrap();
     assert_models(&session.request("AvailableModelsRequest", Value::Map(vec![])).await.unwrap());
@@ -224,11 +269,11 @@ async fn session_reconnects_after_server_drop() {
 
 #[tokio::test]
 async fn request_timeout_and_not_connected() {
-    let addr = spawn_mock_server(ModelsBehavior::SilentOnModels).await;
-    let session = Arc::new(NanaLiveSession::new(session_options(
-        addr,
-        Some(Duration::from_millis(400)),
-    )));
+    let server = spawn_mock_server(ModelsBehavior::SilentOnModels).await;
+    let addr = server.addr;
+    let session = Arc::new(
+        NanaLiveSession::new(session_options(addr, Some(Duration::from_millis(400)))).unwrap(),
+    );
 
     match session.request("AvailableModelsRequest", Value::Map(vec![])).await {
         Err(NanaLiveError::NotConnected) => {}
@@ -250,11 +295,11 @@ async fn request_timeout_and_not_connected() {
 
 #[tokio::test]
 async fn pending_requests_fail_on_drop() {
-    let addr = spawn_mock_server(ModelsBehavior::DropWithoutAnswer).await;
-    let session = Arc::new(NanaLiveSession::new(session_options(
-        addr,
-        Some(Duration::from_secs(5)),
-    )));
+    let server = spawn_mock_server(ModelsBehavior::DropWithoutAnswer).await;
+    let addr = server.addr;
+    let session = Arc::new(
+        NanaLiveSession::new(session_options(addr, Some(Duration::from_secs(5)))).unwrap(),
+    );
 
     session.connect().await.unwrap();
     match session.request("AvailableModelsRequest", Value::Map(vec![])).await {
@@ -262,4 +307,135 @@ async fn pending_requests_fail_on_drop() {
         other => panic!("expected ConnectionClosed, got {other:?}"),
     }
     session.close().await;
+}
+
+#[tokio::test]
+async fn connect_timeout_fires_when_handshake_black_holes() {
+    // 接受 TCP 连接但从不回应握手的"黑洞"服务端。
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            // 收下连接后持有但不回应握手。
+            tokio::spawn(async move {
+                let _held = socket;
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            });
+        }
+    });
+
+    let session = Arc::new(
+        NanaLiveSession::new(SessionOptions {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            identity: Some(identity()),
+            connect_timeout: Some(Duration::from_millis(300)),
+            reconnect: false,
+            retry_delay: Duration::from_millis(20),
+            ..SessionOptions::default()
+        })
+        .unwrap(),
+    );
+    let started = tokio::time::Instant::now();
+    match session.connect().await {
+        Err(NanaLiveError::ConnectTimeout) => {}
+        other => panic!("expected ConnectTimeout, got {other:?}"),
+    }
+    assert!(started.elapsed() < Duration::from_secs(3), "超时未被遵守");
+}
+
+#[tokio::test]
+async fn second_connect_while_connected_does_not_deadlock() {
+    let server = spawn_mock_server(ModelsBehavior::Answer).await;
+    let addr = server.addr;
+    let session = Arc::new(
+        NanaLiveSession::new(session_options(addr, Some(Duration::from_secs(5)))).unwrap(),
+    );
+
+    session.connect().await.unwrap();
+    // 第二次 connect 必须能返回而不是死锁（旧 supervise 停在
+    // await disconnected 上时，先唤醒再等待）。
+    tokio::time::timeout(Duration::from_secs(5), session.connect())
+        .await
+        .expect("second connect deadlocked")
+        .unwrap();
+    assert!(session.is_connected());
+    assert_models(&session.request("AvailableModelsRequest", Value::Map(vec![])).await.unwrap());
+    session.close().await;
+}
+
+#[tokio::test]
+async fn late_response_after_timeout_is_absorbed() {
+    let server = spawn_mock_server(ModelsBehavior::DelayFirstModels).await;
+    let addr = server.addr;
+    let session = Arc::new(
+        NanaLiveSession::new(session_options(addr, Some(Duration::from_millis(150)))).unwrap(),
+    );
+
+    session.connect().await.unwrap();
+    match session.request("AvailableModelsRequest", Value::Map(vec![])).await {
+        Err(NanaLiveError::RequestTimeout) => {}
+        other => panic!("expected RequestTimeout, got {other:?}"),
+    }
+    // 迟到的响应（400ms 后）必须被静默吸收：不触发重连。
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(session.is_connected(), "迟到响应不应触发重连");
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1, "不应发生重连");
+    assert_models(&session.request("AvailableModelsRequest", Value::Map(vec![])).await.unwrap());
+    session.close().await;
+}
+
+#[tokio::test]
+async fn close_during_connect_does_not_leave_zombie_session() {
+    let server = spawn_mock_server(ModelsBehavior::SlowAuth).await;
+    let addr = server.addr;
+    let session = Arc::new(
+        NanaLiveSession::new(session_options(addr, Some(Duration::from_secs(5)))).unwrap(),
+    );
+
+    let connect_task = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { session.connect().await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await; // 建链进行中、鉴权未完成
+    session.close().await;
+    let joined = tokio::time::timeout(Duration::from_secs(5), connect_task)
+        .await
+        .expect("connect did not settle after close");
+    let outcome = joined.expect("connect task panicked");
+    assert!(
+        matches!(outcome, Err(NanaLiveError::ConnectionClosed(_))),
+        "close 之后 connect 不得再成功: {outcome:?}"
+    );
+
+    // 等慢半拍的鉴权回复到达，会话也不得复活。
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(!session.is_connected());
+    assert_eq!(session.status(), SessionStatus::Disconnected);
+    session.close().await; // 幂等
+}
+
+#[test]
+fn invalid_options_are_rejected() {
+    let mut options = SessionOptions::default();
+    options.heartbeat_interval = Duration::ZERO;
+    assert!(matches!(
+        NanaLiveSession::new(options),
+        Err(NanaLiveError::InvalidOption(_))
+    ));
+
+    let mut options = SessionOptions::default();
+    options.retry_delay = Duration::ZERO;
+    assert!(matches!(
+        NanaLiveSession::new(options),
+        Err(NanaLiveError::InvalidOption(_))
+    ));
+
+    let mut options = SessionOptions::default();
+    options.retry_delay = Duration::from_secs(10);
+    options.max_retry_delay = Duration::from_secs(5);
+    assert!(matches!(
+        NanaLiveSession::new(options),
+        Err(NanaLiveError::InvalidOption(_))
+    ));
 }

@@ -78,7 +78,7 @@ const models = await client.listModels();
 | 绑定 | 安装 / 引用 | 连接方式 |
 | --- | --- | --- |
 | [Rust](https://github.com/sena-nana/NanaLiveSDK/tree/main/SDK/rust) | `nanalive-sdk = "0.1"` | `connect(ConnectOptions)` |
-| [Python](https://github.com/sena-nana/NanaLiveSDK/tree/main/SDK/python) | `pip install nanalive-sdk` | `await connect(...)` |
+| [Python](https://github.com/sena-nana/NanaLiveSDK/tree/main/SDK/python) | `pip install nanalive-sdk`（备选网络库：`pip install "nanalive-sdk[aiohttp]"`） | `await connect(...)` |
 | [C#](https://github.com/sena-nana/NanaLiveSDK/tree/main/SDK/csharp) | 引用 `Nanalive.Sdk` 项目 | `await NanaLiveConnection.ConnectAsync(...)` |
 
 以 Python 为例的最小流程（其余语言见各自 README，结构相同）：
@@ -109,7 +109,8 @@ finally:
 四个绑定都提供同语义的弹性会话：Rust 的 `NanaLiveSession`（`session` 模块）、
 Python 的 `NanaLiveSession`（`nanalive_sdk.session`）、C# 的 `NanaLiveSession`，
 选项与 JS 的 `createNanaLiveSession` 一致（`max_retries`、`retry_delay`、
-`heartbeat_interval`、`request_timeout`、`on_status` 等）。以 Python 为例：
+`heartbeat_interval`、`connect_timeout`（默认 5s，覆盖建链+握手+鉴权）、
+`request_timeout`、`on_status` 等）。以 Python 为例：
 
 ```python
 from nanalive_sdk import NanaLiveSession
@@ -125,11 +126,30 @@ models = await session.request("AvailableModelsRequest")
 await session.close()
 ```
 
+回调都在保护下调用：`on_status` / `on_unhandled` 抛出的异常经 `on_error` 上报，
+不会打断自动重连；重连失败的原因（含重试耗尽）也会经 `on_error` 上报。
+
+### Python 传输后端（按常用网络库选择）
+
+Python 绑定的传输层可插拔，`connect()` 与 `NanaLiveSession` 均接受 `transport` 参数：
+
+| `transport` | 网络库 | 安装 |
+| --- | --- | --- |
+| `"websockets"`（默认） | [websockets](https://pypi.org/project/websockets/) | 核心依赖，装完即用 |
+| `"aiohttp"` | [aiohttp](https://pypi.org/project/aiohttp/) | `pip install "nanalive-sdk[aiohttp]"` |
+| 自定义异步工厂 | 任意 | 返回带 `send`/`close`/异步迭代的适配对象，直接传入 |
+
+```python
+session = NanaLiveSession(..., transport="aiohttp")
+```
+
 会话未连接时 `request` 立刻失败（`NotConnectedError` / `NanaLiveError("not_connected")` /
 `NanaLiveConnectionException` / `NanaLiveError::NotConnected`），超时失败为
-`RequestTimeoutError` / `NanaLiveError::RequestTimeout` / `NanaLiveRequestTimeoutException`。
-差异：C# 的心跳映射为 `ClientWebSocket.KeepAliveInterval`，pong 超时由 .NET 运行时内部处理，
-故没有独立的 `heartbeat_timeout` 选项。
+`RequestTimeoutError` / `NanaLiveError::RequestTimeout` / `NanaLiveRequestTimeoutException`，
+建链/鉴权超时为 `NanaLiveConnectionException("connect_timeout")` / `NanaLiveError::ConnectTimeout`。
+差异：C# 的心跳映射为 `ClientWebSocket.KeepAliveInterval`，BCL 未暴露独立 pong 超时
+（运行时按间隔一半判死，10s 间隔 ≈ 5s，与其他语言默认一致），
+Python 的 `aiohttp` 后端 pong 判死窗口同为间隔一半。
 
 注意：未配对的响应（服务器主动推送）仍会透传给调用方：Rust 的 `on_unhandled`
 回调 / `receive` 返回值、Python 的 `on_unhandled` 回调 / `receive` 返回值、

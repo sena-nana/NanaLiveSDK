@@ -4,6 +4,9 @@
 断线后挂起中的请求立即失败，并按指数退避（带抖动）自动重连与重新鉴权。
 通过 ``on_status`` 回调观察 ``connecting`` / ``connected`` / ``reconnecting``
 / ``disconnected`` 状态变化。
+
+所有用户回调（``on_status``/``on_unhandled``/``on_error``）都在保护下调
+用：回调抛出的异常经 ``on_error`` 上报，不会杀死后台重连任务。
 """
 
 from __future__ import annotations
@@ -21,7 +24,8 @@ from .api import (
     RequestTimeoutError,
     _UNSET,
 )
-from .connection import NanaLiveConnection, connect
+from .connection import DEFAULT_MAX_FRAME_SIZE, NanaLiveConnection, connect
+from .transports import TransportOption
 
 STATUS_CONNECTING = "connecting"
 STATUS_CONNECTED = "connected"
@@ -30,14 +34,22 @@ STATUS_DISCONNECTED = "disconnected"
 
 StatusCallback = Callable[[str], None]
 
+#: 建链+握手的默认超时（秒）；``None`` 表示不限制。
+DEFAULT_CONNECT_TIMEOUT = 5.0
+
 
 class NanaLiveSession:
     """NanaLive 插件 API 的弹性会话。
 
-    心跳交给 ``websockets`` 的协议级 ping：每 ``heartbeat_interval`` 秒发
-    ping，``heartbeat_timeout`` 秒内没收到 pong 就断开并触发重连。
+    心跳默认交给 ``websockets`` 后端的协议级 ping：每 ``heartbeat_interval``
+    秒发 ping，``heartbeat_timeout`` 秒内没收到 pong 就断开并触发重连
+    （切换传输后端时语义可能略有差异，见 transports 模块文档）。
     ``max_retries`` 为 ``None`` 时无限重试；``request_timeout`` 默认 30 秒，
-    传 ``None`` 关闭。
+    传 ``None`` 关闭；``connect_timeout`` 默认 5 秒，限制建链+握手。
+
+    会话可在事件循环外构造，但 ``connect``/``request``/``close`` 必须在
+    ``NanaLiveSession`` 绑定的事件循环内调用；跨线程调用请用
+    ``asyncio.run_coroutine_threadsafe``。
     """
 
     def __init__(
@@ -58,11 +70,16 @@ class NanaLiveSession:
         heartbeat_interval: float = 10.0,
         heartbeat_timeout: float = 5.0,
         request_timeout: Optional[float] = 30.0,
+        connect_timeout: Optional[float] = DEFAULT_CONNECT_TIMEOUT,
+        max_frame_size: Optional[int] = DEFAULT_MAX_FRAME_SIZE,
+        transport: TransportOption = "websockets",
     ) -> None:
         if heartbeat_interval <= 0:
             raise ValueError("heartbeat_interval 必须为正数")
         if retry_delay <= 0 or max_retry_delay < retry_delay:
             raise ValueError("retry_delay/max_retry_delay 配置无效")
+        if connect_timeout is not None and connect_timeout <= 0:
+            raise ValueError("connect_timeout 必须为正数或 None")
         self.host = host
         self.port = port
         self._on_unhandled = on_unhandled
@@ -75,6 +92,9 @@ class NanaLiveSession:
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat_timeout = heartbeat_timeout
         self._request_timeout = request_timeout
+        self._connect_timeout = connect_timeout
+        self._max_frame_size = max_frame_size
+        self._transport = transport
 
         self._outbound: Optional[asyncio.Queue] = None
         self._connection: Optional[NanaLiveConnection] = None
@@ -87,6 +107,8 @@ class NanaLiveSession:
         self._status = STATUS_DISCONNECTED
         self._closed = False
         self._supervisor: Optional[asyncio.Task] = None
+        #: 连接代数：close()/connect() 递增，让陈旧的后台任务自行退出。
+        self._generation = 0
 
     @property
     def client(self) -> NanaLiveClient:
@@ -106,18 +128,32 @@ class NanaLiveSession:
             raise NotConnectedError()
         self._outbound.put_nowait(payload)
 
+    def _report(self, message: str) -> None:
+        if self._on_error is None:
+            return
+        try:
+            self._on_error(message)
+        except Exception:
+            pass
+
     def _set_status(self, status: str) -> None:
         if self._status == status:
             return
         self._status = status
-        self._on_status and self._on_status(status)
+        if self._on_status is None:
+            return
+        try:
+            self._on_status(status)
+        except Exception as exc:
+            # 回调异常经 on_error 上报，绝不能打断会话自身。
+            self._report(f"on_status callback error: {exc}")
 
     def _backoff(self, attempt: int) -> float:
         base = min(self._retry_delay * 2 ** (attempt - 1), self._max_retry_delay)
         return max(0.0, base * (1 + 0.2 * (random.random() * 2 - 1)))
 
     # 建立一次连接并完成鉴权；失败时清理半开连接后向上抛。
-    async def _establish(self) -> NanaLiveConnection:
+    async def _establish(self, generation: int) -> NanaLiveConnection:
         connection = await connect(
             host=self.host,
             port=self.port,
@@ -126,16 +162,31 @@ class NanaLiveSession:
             client=self._client,
             ping_interval=self._heartbeat_interval,
             ping_timeout=self._heartbeat_timeout,
+            open_timeout=self._connect_timeout,
+            max_size=self._max_frame_size,
+            transport=self._transport,
         )
+        # close()/connect() 可能在建链期间递增代数；此时这半开连接
+        # 已无人认领，直接丢弃。
+        if generation != self._generation:
+            await _close_quietly(connection)
+            raise ConnectionLostError()
         self._connection = connection
         self._outbound = connection.outbound
         try:
             await self._client.authenticate()
         except Exception:
-            self._connection = None
-            self._outbound = None
+            if self._connection is connection:
+                self._connection = None
+                self._outbound = None
             await _close_quietly(connection)
             raise
+        if generation != self._generation:
+            if self._connection is connection:
+                self._connection = None
+                self._outbound = None
+            await _close_quietly(connection)
+            raise ConnectionLostError()
         self._set_status(STATUS_CONNECTED)
         return connection
 
@@ -144,6 +195,9 @@ class NanaLiveSession:
         while True:
             await connection.closed.wait()
             self._client.fail_pending(ConnectionLostError())
+            # 出站泵阻塞在队列上不会自行退出，必须显式关闭旧连接，
+            # 否则每次重连泄漏一个任务。
+            await _close_quietly(connection)
             self._connection = None
             self._outbound = None
             if self._closed:
@@ -155,6 +209,9 @@ class NanaLiveSession:
             while True:
                 attempt += 1
                 if self._max_retries is not None and attempt > self._max_retries:
+                    self._report(
+                        f"reconnect failed: exhausted {self._max_retries} retries"
+                    )
                     self._set_status(STATUS_DISCONNECTED)
                     return
                 self._set_status(STATUS_RECONNECTING)
@@ -162,11 +219,12 @@ class NanaLiveSession:
                 if self._closed:
                     return
                 try:
-                    connection = await self._establish()
+                    connection = await self._establish(self._generation)
                     break
-                except Exception:
+                except Exception as exc:
                     if self._closed:
                         return
+                    self._report(f"reconnect attempt {attempt} failed: {exc}")
 
     async def connect(self) -> None:
         """建立会话（内联重试直到首个连接完成鉴权）。
@@ -174,6 +232,8 @@ class NanaLiveSession:
         之后的断线由后台任务自动重连；重复调用会重置会话并重新连接。
         重试耗尽（或 ``reconnect=False`` 且连不上）时抛出最后一次错误。
         """
+        self._generation += 1
+        generation = self._generation
         if self._supervisor is not None and not self._supervisor.done():
             self._supervisor.cancel()
             await asyncio.gather(self._supervisor, return_exceptions=True)
@@ -183,6 +243,8 @@ class NanaLiveSession:
             await _close_quietly(self._connection)
             self._connection = None
         self._outbound = None
+        # 被替换连接上的挂起请求立即失败，而不是干等请求超时。
+        self._client.fail_pending(ConnectionLostError())
 
         attempt = 0
         while True:
@@ -190,7 +252,7 @@ class NanaLiveSession:
                 STATUS_CONNECTING if attempt == 0 else STATUS_RECONNECTING
             )
             try:
-                connection = await self._establish()
+                connection = await self._establish(generation)
             except Exception as exc:
                 attempt += 1
                 if (
@@ -205,6 +267,9 @@ class NanaLiveSession:
                         else NanaLiveError(str(exc))
                     ) from None
                 await asyncio.sleep(self._backoff(attempt))
+                if self._closed or generation != self._generation:
+                    self._set_status(STATUS_DISCONNECTED)
+                    raise ConnectionLostError() from None
                 continue
             self._supervisor = asyncio.get_running_loop().create_task(
                 self._supervise(connection)
@@ -219,7 +284,8 @@ class NanaLiveSession:
         """发送一条请求并等待配对的响应；断线时立刻失败。
 
         会话未连接时抛 :class:`NotConnectedError`；超过会话级的
-        ``request_timeout`` 抛 :class:`RequestTimeoutError`。
+        ``request_timeout`` 抛 :class:`RequestTimeoutError`（迟到的响应
+        会被静默吸收，不会影响连接）。
         """
         if self._connection is None or self._connection.closed.is_set():
             raise NotConnectedError()
@@ -237,6 +303,8 @@ class NanaLiveSession:
         if self._closed:
             return
         self._closed = True
+        # 先作废在途的 establish（建链/鉴权中的半开连接会被其自身清理）。
+        self._generation += 1
         if self._supervisor is not None:
             self._supervisor.cancel()
             await asyncio.gather(self._supervisor, return_exceptions=True)

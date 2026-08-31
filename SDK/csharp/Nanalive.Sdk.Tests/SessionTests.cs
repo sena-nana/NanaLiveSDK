@@ -125,6 +125,111 @@ public sealed class SessionTests
         await session.CloseAsync();
     }
 
+    [Fact]
+    public async Task Session_SecondConnect_ResetsCleanly()
+    {
+        using var server = new MockNanaLiveServer(ModelsBehavior.Answer);
+        server.RunAsync();
+        var session = await NanaLiveSession.ConnectAsync(new SessionOptions
+        {
+            Port = server.Port,
+            Identity = TestIdentity,
+            HeartbeatInterval = TimeSpan.FromSeconds(1),
+            RetryDelay = TimeSpan.FromMilliseconds(50),
+            MaxRetryDelay = TimeSpan.FromMilliseconds(100),
+        });
+        var first = await session.RequestAsync("AvailableModelsRequest");
+        Assert.Equal("m-1", FirstModelId(first));
+
+        // 第二次 ConnectAsync 必须能返回（先关旧连接再建新连接），会话仍可用。
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await session.ConnectAsync(timeoutCts.Token);
+        Assert.True(session.IsConnected);
+        var models = await session.RequestAsync("AvailableModelsRequest");
+        Assert.Equal("m-1", FirstModelId(models));
+        await session.CloseAsync();
+    }
+
+    [Fact]
+    public async Task Session_ConnectTimeout_WhenHandshakeBlackHoles()
+    {
+        // 接受 TCP 连接但从不回应握手的"黑洞"服务端。
+        using var probe = new TcpListener(IPAddress.Loopback, 0);
+        probe.Start();
+        var port = ((IPEndPoint)probe.LocalEndpoint).Port;
+        _ = Task.Run(async () =>
+        {
+            while (true)
+            {
+                var client = await probe.AcceptTcpClientAsync();
+                _ = Task.Run(async () =>
+                {
+                    using (client)
+                    {
+                        await Task.Delay(Timeout.Infinite);
+                    }
+                });
+            }
+        });
+
+        var session = new NanaLiveSession(new SessionOptions
+        {
+            Port = port,
+            Identity = TestIdentity,
+            ConnectTimeout = TimeSpan.FromMilliseconds(300),
+            Reconnect = false,
+            RetryDelay = TimeSpan.FromMilliseconds(20),
+        });
+        var exception = await Assert.ThrowsAsync<NanaLiveConnectionException>(
+            () => session.ConnectAsync());
+        Assert.Equal("connect_timeout", exception.Message);
+    }
+
+    [Fact]
+    public async Task Session_CloseDuringConnect_DoesNotLeaveZombieSession()
+    {
+        using var server = new MockNanaLiveServer(ModelsBehavior.SlowAuth);
+        server.RunAsync();
+        var session = new NanaLiveSession(new SessionOptions
+        {
+            Port = server.Port,
+            Identity = TestIdentity,
+            RetryDelay = TimeSpan.FromMilliseconds(50),
+            MaxRetryDelay = TimeSpan.FromMilliseconds(100),
+        });
+
+        var connectTask = session.ConnectAsync();
+        await Task.Delay(100); // 建链进行中、鉴权未完成
+        await session.CloseAsync();
+        await Assert.ThrowsAnyAsync<Exception>(() => connectTask);
+        Assert.Equal(NanaLiveSessionStatus.Disconnected, session.Status);
+
+        // 等慢半拍的鉴权回复到达，会话也不得复活。
+        await Task.Delay(700);
+        Assert.False(session.IsConnected);
+        Assert.Equal(NanaLiveSessionStatus.Disconnected, session.Status);
+        await session.CloseAsync(); // 幂等
+    }
+
+    [Fact]
+    public async Task Session_RequestCancellation_IsNotReportedAsTimeout()
+    {
+        using var server = new MockNanaLiveServer(ModelsBehavior.SilentOnModels);
+        server.RunAsync();
+        var session = await NanaLiveSession.ConnectAsync(new SessionOptions
+        {
+            Port = server.Port,
+            Identity = TestIdentity,
+            RequestTimeout = TimeSpan.FromSeconds(30),
+        });
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+        // 取消必须抛 OperationCanceledException（含其子类），而不是被误报成请求超时。
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => session.RequestAsync("AvailableModelsRequest", null, cts.Token));
+        await session.CloseAsync();
+    }
+
     private static string FirstModelId(object? response) =>
         response!.GetField("data")!.GetField("models")!.TryList()![0]
             .GetField("modelID")!.TryString()!;
@@ -143,6 +248,9 @@ public sealed class SessionTests
 
         /// <summary>不回答也不断开，用于请求超时测试。</summary>
         SilentOnModels,
+
+        /// <summary>AuthenticationTokenRequest 先拖 500ms 再回答（留出 close 窗口）。</summary>
+        SlowAuth,
     }
 
     /// <summary>本地 mock 服务端：循环接受多条连接（会话层重连会用）。</summary>
@@ -214,6 +322,22 @@ public sealed class SessionTests
                 var request = Mp.Deserialize(message.ToArray())!;
                 var requestId = request.GetField("requestID")!.TryString()!;
                 var messageType = request.GetField("messageType")!.TryString()!;
+
+                if (_behavior == ModelsBehavior.SlowAuth
+                    && messageType == "AuthenticationTokenRequest")
+                {
+                    // 慢鉴权：拖过 close() 的窗口后再回答。
+                    await Task.Delay(500);
+                    var delayed = Route(requestId, messageType);
+                    if (delayed is not null)
+                    {
+                        await webSocket.SendAsync(
+                            Mp.Serialize(delayed),
+                            WebSocketMessageType.Binary, true, CancellationToken.None);
+                    }
+                    continue;
+                }
+
                 var response = Route(requestId, messageType);
                 if (response is null)
                 {

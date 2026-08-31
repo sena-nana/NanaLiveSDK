@@ -51,22 +51,30 @@ let session = Arc::new(NanaLiveSession::new(SessionOptions {
     on_token: Some(Arc::new(|token| save_token(token))),
     on_status: Some(Arc::new(|status| println!("{status:?}"))), // Connecting / Connected / Reconnecting / Disconnected
     ..SessionOptions::default()
-}));
+})?);
 
 session.connect().await?; // 含重试；之后的断线由后台任务自动重连
 let models = session.request("AvailableModelsRequest", rmpv::Value::Map(vec![])).await?;
 session.close().await;
 ```
 
-方法：`client()`（底层协议客户端，token 跨重连复用）、`connect()`（需 `self: &Arc<Self>`，幂等）、
-`request(message_type, data)`、`close()`、`status()`。选项（均有默认值）：`host`/`port`、
-`identity`/`token`/`on_token`、`on_unhandled`/`on_error`/`on_status`、`reconnect`（默认 `true`）、
+方法：`client()`（底层协议客户端，token 跨重连复用）、`connect()`（需 `self: &Arc<Self>`）、
+`request(message_type, data)`、`close()`、`status()`、`is_connected()`。选项（均有默认值）：
+`host`/`port`、`identity`/`token`/`on_token`、`on_unhandled`/`on_error`/`on_status`、`reconnect`（默认 `true`）、
 `max_retries`（默认无限）、`retry_delay`/`max_retry_delay`（500ms/8s）、
 `heartbeat_interval`/`heartbeat_timeout`（10s/5s，空闲超间隔发 WebSocket ping）、
+`connect_timeout`（5s，覆盖建链+握手+鉴权；`None` 关闭）、
 `request_timeout`（30s，`None` 关闭）。
 
+`NanaLiveSession::new` 校验选项（`heartbeat_interval`/`retry_delay` 必须为正且
+`retry_delay` 不超过上限），非法时返回 `NanaLiveError::InvalidOption`。
+
+回调都在保护下调用：`on_status`/`on_unhandled` 的 panic 经 `catch_unwind` 隔离，
+不会带走泵任务；重连失败的原因也会经 `on_error` 上报。
+
 会话未连接时 `request` 返回 `NanaLiveError::NotConnected`；超时返回 `NanaLiveError::RequestTimeout`；
-断线时挂起请求以 `NanaLiveError::ConnectionClosed` 失败。
+建链/鉴权超时返回 `NanaLiveError::ConnectTimeout`；断线时挂起请求以
+`NanaLiveError::ConnectionClosed` 失败。
 
 ## API 一览
 

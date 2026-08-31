@@ -58,9 +58,14 @@ public sealed class SessionOptions
 
     /// <summary>
     /// 心跳间隔，默认 10 秒；映射为 <see cref="ClientWebSocket.Options.KeepAliveInterval"/>，
-    /// 空闲超过该时长即发送协议级 ping，pong 超时由 .NET 运行时内部处理。
+    /// 空闲超过该时长即发送协议级 ping。BCL 未暴露独立的 pong 超时：运行时
+    /// 按间隔的一半判死（10 秒间隔 ≈ 5 秒无 pong 断开），与其他语言的
+    /// <c>heartbeat_timeout = 5s</c> 默认语义一致。
     /// </summary>
     public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>建链、握手与鉴权的总时长上限，默认 5 秒；<c>null</c> 表示不限制。</summary>
+    public TimeSpan? ConnectTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>单请求超时，默认 30 秒；<c>null</c> 表示不限制。</summary>
     public TimeSpan? RequestTimeout { get; set; } = TimeSpan.FromSeconds(30);
@@ -131,7 +136,24 @@ public sealed class NanaLiveSession : IAsyncDisposable
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
     {
         await StopSupervisorAsync();
-        _closed = false;
+        lock (_gate)
+        {
+            _closed = false;
+        }
+        // 被替换的旧连接立即关闭，挂起请求立即失败；否则每次重复
+        // ConnectAsync 都会泄漏一条连接和两个泵任务。
+        NanaLiveConnection? previous;
+        lock (_gate)
+        {
+            previous = _connection;
+            _connection = null;
+            _outbound = null;
+        }
+        if (previous is not null)
+        {
+            await CloseQuietlyAsync(previous);
+        }
+        _client.FailPending(new NanaLiveConnectionException("connection_lost"));
 
         var attempt = 0;
         while (true)
@@ -142,12 +164,12 @@ public sealed class NanaLiveSession : IAsyncDisposable
             NanaLiveConnection connection;
             try
             {
-                connection = await EstablishAsync();
+                connection = await EstablishAsync(cancellationToken);
             }
             catch (Exception)
             {
                 attempt += 1;
-                if (_closed
+                if (IsClosed()
                     || !_options.Reconnect
                     || (_options.MaxRetries is { } maxRetries && attempt > maxRetries))
                 {
@@ -155,12 +177,16 @@ public sealed class NanaLiveSession : IAsyncDisposable
                     throw;
                 }
                 await Task.Delay(Backoff(attempt), cancellationToken);
+                if (IsClosed())
+                {
+                    SetStatus(NanaLiveSessionStatus.Disconnected);
+                    throw new NanaLiveConnectionException("closed");
+                }
                 continue;
             }
-            if (_closed)
+            if (IsClosed())
             {
-                try { await connection.CloseAsync(); }
-                catch (Exception) { /* 忽略关闭失败 */ }
+                await CloseQuietlyAsync(connection);
                 throw new NanaLiveConnectionException("closed");
             }
             StartSupervisor(connection);
@@ -171,6 +197,7 @@ public sealed class NanaLiveSession : IAsyncDisposable
     /// <summary>发送一条请求并等待配对的响应；断线时立刻失败。</summary>
     /// <exception cref="NanaLiveConnectionException">会话未连接。</exception>
     /// <exception cref="NanaLiveRequestTimeoutException">超过 <see cref="SessionOptions.RequestTimeout"/>。</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> 被取消。</exception>
     public async Task<object?> RequestAsync(
         string messageType, object? data = null, CancellationToken cancellationToken = default)
     {
@@ -184,17 +211,27 @@ public sealed class NanaLiveSession : IAsyncDisposable
             throw new NanaLiveConnectionException("not_connected");
         }
 
-        var pending = _client.RequestAsync(messageType, data);
+        var pending = _client.RequestAsync(messageType, data, cancellationToken);
         if (_options.RequestTimeout is { } timeout)
         {
-            var completed = await Task.WhenAny(pending, Task.Delay(timeout, cancellationToken));
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var delayTask = Task.Delay(timeout, timeoutCts.Token);
+            var completed = await Task.WhenAny(pending, delayTask);
             if (completed != pending)
             {
+                // 超时放弃等待：迟到的失败不触发 UnobservedTaskException。
                 _ = pending.ContinueWith(
                     task => _ = task.Exception,
                     TaskContinuationOptions.OnlyOnFaulted);
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    // 取消不是超时：调用方必须能区分二者。
+                    throw new OperationCanceledException(cancellationToken);
+                }
                 throw new NanaLiveRequestTimeoutException();
             }
+            // 请求先完成：取消计时器任务，释放底层 Timer。
+            timeoutCts.Cancel();
         }
         return await pending;
     }
@@ -202,11 +239,14 @@ public sealed class NanaLiveSession : IAsyncDisposable
     /// <summary>停止重连并关闭底层连接；挂起中的请求立即失败。</summary>
     public async Task CloseAsync()
     {
-        if (_closed)
+        lock (_gate)
         {
-            return;
+            if (_closed)
+            {
+                return;
+            }
+            _closed = true;
         }
-        _closed = true;
         await StopSupervisorAsync();
 
         NanaLiveConnection? connection;
@@ -218,14 +258,7 @@ public sealed class NanaLiveSession : IAsyncDisposable
         }
         if (connection is not null)
         {
-            try
-            {
-                await connection.CloseAsync();
-            }
-            catch (Exception)
-            {
-                // 关闭阶段的异常不影响调用方。
-            }
+            await CloseQuietlyAsync(connection);
         }
         _client.FailPending(new NanaLiveConnectionException("connection_lost"));
         SetStatus(NanaLiveSessionStatus.Disconnected);
@@ -233,17 +266,39 @@ public sealed class NanaLiveSession : IAsyncDisposable
 
     public async ValueTask DisposeAsync() => await CloseAsync();
 
-    // 建立一次连接并完成鉴权；失败时清理半开连接后向上抛。
-    private async Task<NanaLiveConnection> EstablishAsync()
+    private bool IsClosed()
     {
-        var connection = await NanaLiveConnection.ConnectAsync(new ConnectOptions
+        lock (_gate)
         {
-            Host = _options.Host,
-            Port = _options.Port,
-            KeepAliveInterval = _options.HeartbeatInterval,
-            OnUnhandled = _options.OnUnhandled,
-            OnError = _options.OnError,
-        }, _client);
+            return _closed;
+        }
+    }
+
+    private static async Task CloseQuietlyAsync(NanaLiveConnection connection)
+    {
+        try
+        {
+            await connection.CloseAsync();
+        }
+        catch (Exception)
+        {
+            // 关闭阶段的异常不影响调用方。
+        }
+    }
+
+    // 建立一次连接并完成鉴权；失败时清理半开连接后向上抛。
+    private async Task<NanaLiveConnection> EstablishAsync(CancellationToken cancellationToken)
+    {
+        var connection = await WithConnectTimeoutAsync(
+            token => NanaLiveConnection.ConnectAsync(new ConnectOptions
+            {
+                Host = _options.Host,
+                Port = _options.Port,
+                KeepAliveInterval = _options.HeartbeatInterval,
+                OnUnhandled = _options.OnUnhandled,
+                OnError = _options.OnError,
+            }, _client, token),
+            cancellationToken);
         lock (_gate)
         {
             _connection = connection;
@@ -251,7 +306,8 @@ public sealed class NanaLiveSession : IAsyncDisposable
         }
         try
         {
-            await _client.AuthenticateAsync();
+            await WithConnectTimeoutAsync(
+                token => _client.AuthenticateAsync(token), cancellationToken);
         }
         catch
         {
@@ -263,12 +319,31 @@ public sealed class NanaLiveSession : IAsyncDisposable
                     _outbound = null;
                 }
             }
-            try { await connection.CloseAsync(); }
-            catch (Exception) { /* 忽略关闭失败 */ }
+            await CloseQuietlyAsync(connection);
             throw;
         }
         SetStatus(NanaLiveSessionStatus.Connected);
         return connection;
+    }
+
+    // 连接与鉴权阶段受 ConnectTimeout 约束；取消传播调用方的 ct。
+    private async Task<T> WithConnectTimeoutAsync<T>(
+        Func<CancellationToken, Task<T>> action, CancellationToken cancellationToken)
+    {
+        if (_options.ConnectTimeout is not { } connectTimeout)
+        {
+            return await action(cancellationToken);
+        }
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        linked.CancelAfter(connectTimeout);
+        try
+        {
+            return await action(linked.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new NanaLiveConnectionException("connect_timeout");
+        }
     }
 
     // 断开后的后台重连循环；close() 通过 CTS 终止本任务。
@@ -321,6 +396,7 @@ public sealed class NanaLiveSession : IAsyncDisposable
                         attempt += 1;
                         if (_options.MaxRetries is { } maxRetries && attempt > maxRetries)
                         {
+                            ReportError($"reconnect_retries_exhausted: {_options.MaxRetries}");
                             SetStatus(NanaLiveSessionStatus.Disconnected);
                             return;
                         }
@@ -339,19 +415,21 @@ public sealed class NanaLiveSession : IAsyncDisposable
                         }
                         try
                         {
-                            connection = await EstablishAsync();
+                            connection = await EstablishAsync(cancellationToken);
                             break;
                         }
                         catch (OperationCanceledException)
                         {
                             return;
                         }
-                        catch
+                        catch (Exception error)
                         {
                             if (cancellationToken.IsCancellationRequested || _closed)
                             {
                                 return;
                             }
+                            // 重连失败原因必须可观测，否则只能看到永远在重连。
+                            ReportError(error.Message);
                         }
                     }
                 }
@@ -397,6 +475,18 @@ public sealed class NanaLiveSession : IAsyncDisposable
         return TimeSpan.FromMilliseconds(Math.Max(0, baseDelay + jitter));
     }
 
+    private void ReportError(string message)
+    {
+        try
+        {
+            _options.OnError?.Invoke(message);
+        }
+        catch
+        {
+            // onError 自身抛错不能外溢到监督任务。
+        }
+    }
+
     private void SetStatus(NanaLiveSessionStatus status)
     {
         Action<NanaLiveSessionStatus>? onStatus;
@@ -409,6 +499,14 @@ public sealed class NanaLiveSession : IAsyncDisposable
             _status = status;
             onStatus = _options.OnStatus;
         }
-        onStatus?.Invoke(status);
+        try
+        {
+            onStatus?.Invoke(status);
+        }
+        catch (Exception error)
+        {
+            // 回调异常经 OnError 上报，绝不能打断监督任务。
+            ReportError($"on_status callback error: {error.Message}");
+        }
     }
 }

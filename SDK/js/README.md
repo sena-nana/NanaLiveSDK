@@ -57,12 +57,16 @@ const models = await session.request("AvailableModelsRequest");
 await session.close();
 ```
 
-返回对象：`client`、`connect()`、`request(messageType, data)`、`close()`、`status`、`isConnected`。选项（均有默认值）：`host`/`port`/`subprotocol`、`identity`/`token`/`onToken`、`onUnhandled`/`onError`/`onStatus`、`reconnect`（默认 `true`）、`maxRetries`（默认无限）、`retryDelay`/`maxRetryDelay`（500ms/8s）、`heartbeatInterval`/`heartbeatTimeout`（10s/5s）、`connectTimeout`（5s）、`requestTimeout`（30s，`null` 关闭）。
+返回对象：`client`、`connect()`、`request(messageType, data)`、`close()`、`status`、`isConnected`。选项（均有默认值）：`host`/`port`/`subprotocol`、`identity`/`token`/`onToken`、`onUnhandled`/`onError`/`onStatus`、`reconnect`（默认 `true`）、`maxRetries`（默认无限）、`retryDelay`/`maxRetryDelay`（500ms/8s）、`heartbeatInterval`/`heartbeatTimeout`（10s/5s）、`connectTimeout`（5s，建链+握手超时）、`requestTimeout`（30s，`null` 或 `0` 关闭）。
+
+回调都在保护下调用：`onStatus`/`onUnhandled` 抛出的异常经 `onError` 上报，不会打断自动重连；重连失败的原因（含 `maxRetries` 耗尽）也会经 `onError` 上报。
+
+会话未连接时 `request` 抛 `not_connected`；超时抛 `request_timeout`（迟到的响应会被静默吸收，不影响连接）；断线时挂起请求以 `connection_lost` 失败。
 
 ## 导出
 
-- `.`：协议常量（`API_NAME`、`API_VERSION`、`SUBPROTOCOL`、`DEFAULT_PORT`）、`createNanaLiveClient`，以及 `executableHotkeys`、`parameterValueAfterTicks`、`writeParameterCommand` 等助手。
-- `./node-websocket`：仅 Node 环境可用的极简 WebSocket 客户端（`connectBinaryWebSocket`、`connectTextWebSocket`）。浏览器环境可直接用全局 `WebSocket`。
+- `.`：协议常量（`API_NAME`、`API_VERSION`、`SUBPROTOCOL`、`DEFAULT_PORT`）、`createNanaLiveClient`（含 `requestWithId`/`cancelRequest`，供上层自行管理请求超时），以及 `executableHotkeys`、`parameterValueAfterTicks`、`writeParameterCommand` 等助手。
+- `./node-websocket`：仅 Node 环境可用的极简 WebSocket 客户端（`connectBinaryWebSocket`、`connectTextWebSocket`，支持分片帧、握手校验与 16 MiB 消息上限）。浏览器环境可直接用全局 `WebSocket`。
 - `./session`：仅 Node 环境可用的弹性会话 `createNanaLiveSession`（自动重连、心跳、请求超时）。
 
 ## 本地开发

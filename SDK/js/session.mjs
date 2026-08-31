@@ -67,7 +67,20 @@ export function createNanaLiveSession(options = {}) {
   function setStatus(next) {
     if (status === next) return;
     status = next;
-    onStatus?.(next);
+    try {
+      onStatus?.(next);
+    } catch (error) {
+      // 回调异常经 onError 上报，绝不能打断会话自身。
+      reportError(error);
+    }
+  }
+
+  function reportError(error) {
+    try {
+      onError?.(error);
+    } catch {
+      // onError 自身抛错不能外泄到后台任务。
+    }
   }
 
   function noteActivity() {
@@ -110,7 +123,10 @@ export function createNanaLiveSession(options = {}) {
   }
 
   function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      if (typeof timer.unref === "function") timer.unref();
+    });
   }
 
   function backoffDelay() {
@@ -137,17 +153,21 @@ export function createNanaLiveSession(options = {}) {
           try {
             decoded = client.receive(payload);
           } catch (error) {
-            onError?.(error);
+            reportError(error);
             return;
           }
           // 配对过的响应带 requestID；只有服务器主动推送才透传。
           if (decoded && decoded.requestID === undefined) {
-            onUnhandled?.(decoded);
+            try {
+              onUnhandled?.(decoded);
+            } catch (error) {
+              reportError(error);
+            }
           }
         },
         onPong: noteActivity,
         onClose: () => handleDisconnect(socket),
-        onError: (error) => onError?.(error),
+        onError: (error) => reportError(error),
       });
       if (!isCurrent(myEpisode)) throw new Error("superseded");
       currentSocket = socket;
@@ -163,9 +183,13 @@ export function createNanaLiveSession(options = {}) {
       // 导致 await establish() 一直等到断线才返回。
       return { disconnected };
     } catch (error) {
-      stopHeartbeat();
-      currentSocket = null;
-      resolveDisconnected = null;
+      // 只在仍是当前代时清理共享状态；陈旧的 establish 绝不能
+      // 停掉新连接的心跳或清空新连接的句柄。
+      if (isCurrent(myEpisode)) {
+        stopHeartbeat();
+        currentSocket = null;
+        resolveDisconnected = null;
+      }
       if (socket) {
         try {
           socket.close();
@@ -189,6 +213,7 @@ export function createNanaLiveSession(options = {}) {
       while (true) {
         attempt += 1;
         if (maxRetries !== null && attempt > maxRetries) {
+          reportError(new Error("reconnect_retries_exhausted"));
           setStatus(DISCONNECTED);
           return;
         }
@@ -200,6 +225,8 @@ export function createNanaLiveSession(options = {}) {
           break;
         } catch (error) {
           if (!isCurrent(myEpisode)) return;
+          // 重连失败原因必须可观测，否则只能看到永远在 reconnecting。
+          reportError(error);
         }
       }
     }
@@ -212,7 +239,9 @@ export function createNanaLiveSession(options = {}) {
     const myEpisode = episode;
     const previous = supervisorDone;
     supervisorDone = null;
-    if (previous) await previous;
+    // 顺序很关键：先关旧连接、唤醒旧 supervise，再等它退出。
+    // 若先 await previous，旧 supervise 还停在 await disconnected 上，
+    // 而能唤醒它的 signal 排在后面——连接健康时就是死锁。
     stopHeartbeat();
     if (currentSocket) {
       try {
@@ -222,9 +251,11 @@ export function createNanaLiveSession(options = {}) {
       }
       currentSocket = null;
     }
+    client.failPending(new Error("connection_lost"));
     const signal = resolveDisconnected;
     resolveDisconnected = null;
     signal?.();
+    if (previous) await previous;
 
     while (true) {
       setStatus(attempt === 0 ? CONNECTING : RECONNECTING);
@@ -266,18 +297,21 @@ export function createNanaLiveSession(options = {}) {
 
   async function request(messageType, data = {}) {
     if (!currentSocket) throw new Error("not_connected");
-    const pending = client.request(messageType, data);
-    if (!requestTimeout) return pending;
+    const { requestID, promise } = client.requestWithId(messageType, data);
+    if (!requestTimeout) return promise;
+    // 超时放弃等待后，迟到的失败不能触发 unhandled rejection。
+    promise.catch(() => {});
     let timer;
     const timeout = new Promise((_, reject) => {
       timer = setTimeout(() => reject(new Error("request_timeout")), requestTimeout);
     });
     if (typeof timer.unref === "function") timer.unref();
     try {
-      return await Promise.race([pending, timeout]);
+      return await Promise.race([promise, timeout]);
     } finally {
       clearTimeout(timer);
-      pending.catch(() => {});
+      // 超时（或已完成）后注销 waiter：Map 不积累，迟到响应被吸收。
+      client.cancelRequest(requestID);
     }
   }
 

@@ -17,6 +17,11 @@ use crate::client::{Identity, NanaLiveClient, TokenCallback};
 use crate::error::NanaLiveError;
 use crate::{DEFAULT_PORT, SUBPROTOCOL};
 
+/// 用户回调的 panic 隔离：回调崩了不能带走泵任务。
+pub(crate) fn guard<F: FnOnce()>(f: F) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+}
+
 pub type UnhandledCallback = Arc<dyn Fn(Value) + Send + Sync>;
 pub type ErrorCallback = Arc<dyn Fn(String) + Send + Sync>;
 /// 收到任意入站帧（数据/ping/pong）时触发，会话层用它做活动时间戳。
@@ -103,7 +108,9 @@ pub async fn connect(options: ConnectOptions) -> Result<ConnectionHandle, NanaLi
     let outbound_for_send = outbound.clone();
     let client = Arc::new(NanaLiveClient::new(
         move |bytes: Vec<u8>| {
-            let _ = outbound_for_send.send(Message::Binary(bytes));
+            outbound_for_send
+                .send(Message::Binary(bytes))
+                .map_err(|_| NanaLiveError::ConnectionClosed("connection_lost".to_string()))
         },
         identity,
         token,
@@ -151,32 +158,32 @@ async fn establish_connection(
                 inbound = stream.next() => match inbound {
                     Some(Ok(Message::Binary(payload))) => {
                         if let Some(on_activity) = &on_activity {
-                            on_activity();
+                            guard(|| on_activity());
                         }
                         match pump_client.receive(&payload) {
                             Ok(Some(value)) => {
                                 if let Some(on_unhandled) = &on_unhandled {
-                                    on_unhandled(value);
+                                    guard(move || on_unhandled(value));
                                 }
                             }
                             Ok(None) => {}
                             Err(error) => {
                                 if let Some(on_error) = &on_error {
-                                    on_error(error.to_string());
+                                    guard(move || on_error(error.to_string()));
                                 }
                             }
                         }
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         if let Some(on_activity) = &on_activity {
-                            on_activity();
+                            guard(|| on_activity());
                         }
                         // tungstenite 不会自动回 Pong，这里显式回应。
                         let _ = sink.send(Message::Pong(payload)).await;
                     }
                     Some(Ok(Message::Pong(_))) => {
                         if let Some(on_activity) = &on_activity {
-                            on_activity();
+                            guard(|| on_activity());
                         }
                     }
                     Some(Ok(Message::Close(frame))) => {
@@ -190,7 +197,7 @@ async fn establish_connection(
                     }
                     Some(Err(error)) => {
                         if let Some(on_error) = &on_error {
-                            on_error(error.to_string());
+                            guard(move || on_error(error.to_string()));
                         }
                         let _ = sink.close().await;
                         break;
@@ -214,7 +221,7 @@ async fn establish_connection(
             }
         }
         if let Some(on_disconnect) = &on_disconnect {
-            on_disconnect();
+            guard(|| on_disconnect());
         }
     });
 

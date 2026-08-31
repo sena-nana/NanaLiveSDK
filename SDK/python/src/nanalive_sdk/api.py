@@ -16,9 +16,6 @@ DEFAULT_PORT = 8312
 #: 全量程对应的刻度数（与 JS SDK 一致）。
 FULL_RANGE_TICKS = 40.0
 
-#: 全量程对应的刻度数（与 JS SDK 一致）。
-FULL_RANGE_TICKS = 40.0
-
 _UNSET = object()
 
 
@@ -140,7 +137,6 @@ class NanaLiveClient:
         self._on_token = on_token
         self._waiters: Dict[str, asyncio.Future] = {}
         self._sequence = 0
-        self._loop = asyncio.get_running_loop()
 
     async def request(
         self, message_type: str, data: Any = _UNSET
@@ -148,7 +144,9 @@ class NanaLiveClient:
         """发送一条请求并等待配对的响应。"""
         self._sequence += 1
         request_id = f"nanalive-{self._sequence}"
-        future: asyncio.Future = self._loop.create_future()
+        # 惰性取事件循环：客户端可在任意线程/时机构造，只要 request
+        # 在循环内发起即可。
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._waiters[request_id] = future
         envelope = {
             "apiName": API_NAME,
@@ -170,18 +168,28 @@ class NanaLiveClient:
         ``raw`` 可以是 MessagePack 字节或已解码的响应对象。返回 ``None``
         表示响应已配对给等待中的请求；返回非 ``None`` 表示没有匹配的
         等待者（服务器主动推送），原样透传给调用方。
+
+        服务端数据形状异常不会从这里抛出：怪异消息原样透传，只有字节流
+        无法解码（流已错位）才抛 :class:`NanaLiveError`，由连接层断开。
         """
-        response = (
-            msgpack.unpackb(raw, raw=False)
-            if isinstance(raw, (bytes, bytearray, memoryview))
-            else raw
-        )
+        if isinstance(raw, (bytes, bytearray, memoryview)):
+            try:
+                response = msgpack.unpackb(raw, raw=False)
+            except Exception as exc:
+                raise NanaLiveError(f"decode_error: {exc}") from None
+        else:
+            response = raw
         request_id = response.get("requestID") if isinstance(response, dict) else None
         future = self._waiters.pop(request_id, None) if request_id is not None else None
         if future is None:
             return response
+        # 等待者可能已因请求超时被取消（迟到响应），静默吸收即可。
+        if future.done():
+            return None
         if isinstance(response, dict) and response.get("messageType") == "APIError":
-            data = response.get("data") or {}
+            data = response.get("data")
+            if not isinstance(data, dict):
+                data = {}
             future.set_exception(
                 NanaLiveError(data.get("message") or "api_error", data.get("errorCode"))
             )
@@ -203,13 +211,19 @@ class NanaLiveClient:
         return len(waiters)
 
     async def authenticate(self) -> Dict[str, Any]:
-        """两段式鉴权：已有 token 先尝试验证，失败降级为申请新 token。"""
+        """两段式鉴权：已有 token 被服务端拒绝时降级为申请新 token。
+
+        只有服务端明确返回 ``APIError``（而非网络闪断、超时等传输层
+        故障）才会轮换 token；传输层异常原样传播。
+        """
         if self._token:
             try:
                 return await self.request(
                     "AuthenticationRequest", {"authenticationToken": self._token}
                 )
-            except Exception:
+            except NanaLiveError as exc:
+                if type(exc) is not NanaLiveError:
+                    raise  # ConnectionLost/NotConnected/Timeout 等传输层错误
                 self._token = None
 
         issued = await self.request("AuthenticationTokenRequest", self._identity)

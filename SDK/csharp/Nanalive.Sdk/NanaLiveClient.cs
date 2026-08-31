@@ -28,7 +28,8 @@ public sealed class NanaLiveClient
     }
 
     /// <summary>发送一条请求并等待配对的响应。</summary>
-    public Task<object?> RequestAsync(string messageType, object? data = null)
+    public async Task<object?> RequestAsync(
+        string messageType, object? data = null, CancellationToken cancellationToken = default)
     {
         var sequence = Interlocked.Increment(ref _sequence);
         var requestId = $"nanalive-{sequence}";
@@ -58,7 +59,23 @@ public sealed class NanaLiveClient
             completion.TrySetException(error);
             throw;
         }
-        return completion.Task;
+        cancellationToken.ThrowIfCancellationRequested();
+        if (cancellationToken.CanBeCanceled)
+        {
+            try
+            {
+                return await completion.Task.WaitAsync(cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                // 放弃等待后，迟到的失败不能变成 UnobservedTaskException。
+                _ = completion.Task.ContinueWith(
+                    task => _ = task.Exception,
+                    TaskContinuationOptions.OnlyOnFaulted);
+                throw;
+            }
+        }
+        return await completion.Task;
     }
 
     /// <summary>把一段收到的字节喂回客户端。</summary>
@@ -97,11 +114,11 @@ public sealed class NanaLiveClient
         {
             var data = response.GetField("data");
             var message = data.GetField("message")?.TryString() ?? "api_error";
-            completion.SetException(new NanaLiveApiException(message, data.GetField("errorCode")));
+            completion.TrySetException(new NanaLiveApiException(message, data.GetField("errorCode")));
         }
         else
         {
-            completion.SetResult(response);
+            completion.TrySetResult(response);
         }
 
         return null;
@@ -125,8 +142,12 @@ public sealed class NanaLiveClient
         return pending.Length;
     }
 
-    /// <summary>两段式鉴权：已有 token 先尝试验证，失败降级为申请新 token。</summary>
-    public async Task<object?> AuthenticateAsync()
+    /// <summary>两段式鉴权：已有 token 被服务端拒绝时降级为申请新 token。</summary>
+    /// <remarks>
+    /// 只有服务端明确返回 APIError（而非网络闪断、超时等传输层故障）才会
+    /// 轮换 token；传输层异常原样传播。
+    /// </remarks>
+    public async Task<object?> AuthenticateAsync(CancellationToken cancellationToken = default)
     {
         string? saved;
         lock (_gate)
@@ -139,9 +160,10 @@ public sealed class NanaLiveClient
             try
             {
                 return await RequestAsync(
-                    "AuthenticationRequest", Mp.Map(("authenticationToken", Mp.Str(saved))));
+                    "AuthenticationRequest", Mp.Map(("authenticationToken", Mp.Str(saved))),
+                    cancellationToken);
             }
-            catch (Exception)
+            catch (NanaLiveApiException)
             {
                 lock (_gate)
                 {
@@ -151,7 +173,7 @@ public sealed class NanaLiveClient
         }
 
         var issued = await RequestAsync(
-            "AuthenticationTokenRequest", _identity?.ToMessagePack() ?? Mp.Nil);
+            "AuthenticationTokenRequest", _identity?.ToMessagePack() ?? Mp.Nil, cancellationToken);
         var token = issued.GetField("data").GetField("authenticationToken")?.TryString();
         if (string.IsNullOrEmpty(token))
         {
@@ -165,7 +187,8 @@ public sealed class NanaLiveClient
 
         _onToken?.Invoke(token!);
         return await RequestAsync(
-            "AuthenticationRequest", Mp.Map(("authenticationToken", Mp.Str(token!))));
+            "AuthenticationRequest", Mp.Map(("authenticationToken", Mp.Str(token!))),
+            cancellationToken);
     }
 
     /// <summary><c>AvailableModelsRequest</c>。</summary>

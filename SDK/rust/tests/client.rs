@@ -36,7 +36,10 @@ fn setup(
 ) -> Mock {
     let (tx, rx) = std::sync::mpsc::channel();
     let client = Arc::new(NanaLiveClient::new(
-        move |bytes| tx.send(bytes).unwrap(),
+        move |bytes| {
+            let _ = tx.send(bytes);
+            Ok(())
+        },
         identity,
         token,
         on_token,

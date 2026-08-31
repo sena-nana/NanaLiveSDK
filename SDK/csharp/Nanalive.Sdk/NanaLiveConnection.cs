@@ -28,6 +28,8 @@ public sealed class ConnectOptions
     /// <summary>
     /// WebSocket 协议级心跳间隔（<see cref="ClientWebSocket.Options.KeepAliveInterval"/>）。
     /// <c>null</c> 时沿用 BCL 默认值（30 秒）；会话层会把它设为心跳间隔。
+    /// BCL 未暴露独立的 pong 超时：运行时按 KeepAliveInterval 的一半判死，
+    /// 即 10 秒间隔下约 5 秒无 pong 断开（与其他语言默认心跳超时一致）。
     /// </summary>
     public TimeSpan? KeepAliveInterval { get; set; }
 }
@@ -121,8 +123,16 @@ public sealed class NanaLiveConnection : IAsyncDisposable
         _outbound.Writer.TryComplete();
         if (_webSocket.State == WebSocketState.Open)
         {
-            await _webSocket.CloseAsync(
-                WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
+            try
+            {
+                await _webSocket.CloseAsync(
+                    WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
+            }
+            catch (Exception)
+            {
+                // 网络已死时优雅关闭必然失败：直接中止，让泵任务退出。
+                _webSocket.Abort();
+            }
         }
 
         try

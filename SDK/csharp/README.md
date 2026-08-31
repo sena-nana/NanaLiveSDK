@@ -44,16 +44,22 @@ await using var session = await NanaLiveSession.ConnectAsync(new SessionOptions
 var models = await session.RequestAsync("AvailableModelsRequest");
 ```
 
-成员：`Client`（底层协议客户端，token 跨重连复用）、`ConnectAsync()`（幂等）、
-`RequestAsync(messageType, data)`、`CloseAsync()`（实现 `IAsyncDisposable`）、
+成员：`Client`（底层协议客户端，token 跨重连复用）、`ConnectAsync()`、
+`RequestAsync(messageType, data, cancellationToken)`、`CloseAsync()`（实现 `IAsyncDisposable`）、
 `Status`、`IsConnected`。选项（均有默认值）：`Host`/`Port`、`Identity`/`Token`/`OnToken`、
 `OnUnhandled`/`OnError`/`OnStatus`、`Reconnect`（默认 `true`）、`MaxRetries`（默认无限）、
 `RetryDelay`/`MaxRetryDelay`（500ms/8s）、`HeartbeatInterval`（10s，映射为
-`ClientWebSocket.KeepAliveInterval`，pong 超时由 .NET 运行时内部处理）、
-`RequestTimeout`（30s，`null` 关闭）。
+`ClientWebSocket.KeepAliveInterval`；BCL 未暴露独立 pong 超时，运行时按间隔一半判死，
+与其他语言的 `heartbeat_timeout = 5s` 默认语义一致）、`ConnectTimeout`（5s，覆盖建链+握手+鉴权，
+`null` 关闭）、`RequestTimeout`（30s，`null` 关闭）。
+
+回调都在保护下调用：`OnStatus`/`OnUnhandled` 抛出的异常经 `OnError` 上报，不会打断自动重连；
+重连失败的原因（含 `MaxRetries` 耗尽）也会经 `OnError` 上报。
 
 会话未连接时 `RequestAsync` 抛 `NanaLiveConnectionException("not_connected")`；超时抛
-`NanaLiveRequestTimeoutException`；断线时挂起请求以 `NanaLiveConnectionException("connection_lost")` 失败。
+`NanaLiveRequestTimeoutException`；建链/鉴权超时抛 `NanaLiveConnectionException("connect_timeout")`；
+CancellationToken 取消抛 `OperationCanceledException`（与超时可区分）；
+断线时挂起请求以 `NanaLiveConnectionException("connection_lost")` 失败。
 
 ## API 一览
 

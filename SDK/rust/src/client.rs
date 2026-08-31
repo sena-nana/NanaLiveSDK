@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use rmpv::Value;
 use tokio::sync::oneshot;
@@ -10,7 +10,8 @@ use tokio::sync::oneshot;
 use crate::error::NanaLiveError;
 use crate::{API_NAME, API_VERSION, ValueExt};
 
-type SendFn = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
+/// 会话层注入的发送回调：连接不在位时返回 `Err`（请求立即失败而非静默丢弃）。
+type SendFn = Arc<dyn Fn(Vec<u8>) -> Result<(), NanaLiveError> + Send + Sync>;
 /// 首次签发 token 的回调。
 pub type TokenCallback = Arc<dyn Fn(&str) + Send + Sync>;
 type Waiters = Mutex<HashMap<String, oneshot::Sender<Result<Value, NanaLiveError>>>>;
@@ -66,7 +67,7 @@ pub struct NanaLiveClient {
 
 impl NanaLiveClient {
     pub fn new(
-        send: impl Fn(Vec<u8>) + Send + Sync + 'static,
+        send: impl Fn(Vec<u8>) -> Result<(), NanaLiveError> + Send + Sync + 'static,
         identity: Option<Identity>,
         token: Option<String>,
         on_token: Option<TokenCallback>,
@@ -88,20 +89,32 @@ impl NanaLiveClient {
         let (sender, receiver) = oneshot::channel();
         self.waiters
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(request_id.clone(), sender);
 
         let envelope = Value::Map(vec![
             ("apiName".into(), API_NAME.into()),
             ("apiVersion".into(), API_VERSION.into()),
-            ("requestID".into(), request_id.into()),
+            ("requestID".into(), request_id.clone().into()),
             ("messageType".into(), message_type.into()),
             ("data".into(), data),
         ]);
         let mut bytes = Vec::new();
-        rmpv::encode::write_value(&mut bytes, &envelope)
-            .map_err(|error| NanaLiveError::Encode(error.to_string()))?;
-        (self.send)(bytes);
+        // 编码或发送失败都要摘掉 waiter，否则条目泄漏到断线为止。
+        if let Err(error) = rmpv::encode::write_value(&mut bytes, &envelope) {
+            self.waiters
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&request_id);
+            return Err(NanaLiveError::Encode(error.to_string()));
+        }
+        if let Err(error) = (self.send)(bytes) {
+            self.waiters
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&request_id);
+            return Err(error);
+        }
 
         match receiver.await {
             Ok(result) => result,
@@ -127,7 +140,12 @@ impl NanaLiveClient {
             .get("requestID")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let waiter = request_id.and_then(|id| self.waiters.lock().unwrap().remove(&id));
+        let waiter = request_id.and_then(|id| {
+            self.waiters
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&id)
+        });
         let Some(waiter) = waiter else {
             return Some(response);
         };
@@ -153,7 +171,7 @@ impl NanaLiveClient {
     ///
     /// 返回清掉的等待者数量。
     pub fn fail_pending(&self, error: NanaLiveError) -> usize {
-        let mut waiters = self.waiters.lock().unwrap();
+        let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
         let count = waiters.len();
         for (_, sender) in waiters.drain() {
             let _ = sender.send(Err(error.clone()));
@@ -161,17 +179,28 @@ impl NanaLiveClient {
         count
     }
 
-    /// 两段式鉴权：已有 token 先尝试验证，失败降级为申请新 token。
+    /// 两段式鉴权：已有 token 被服务端拒绝时降级为申请新 token。
+    ///
+    /// 只有服务端明确返回 `APIError`（而非网络闪断、超时等传输层故障）
+    /// 才会轮换 token；传输层错误原样传播。
     pub async fn authenticate(&self) -> Result<Value, NanaLiveError> {
         // 先克隆出锁再进入 await，避免 MutexGuard 跨 await。
-        let saved = self.token.lock().unwrap().clone();
+        let saved = self
+            .token
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         if let Some(token) = saved {
             let payload = Value::Map(vec![("authenticationToken".into(), token.into())]);
             match self.request("AuthenticationRequest", payload).await {
                 Ok(response) => return Ok(response),
-                Err(_) => {
-                    *self.token.lock().unwrap() = None;
+                Err(NanaLiveError::Api { .. }) => {
+                    *self
+                        .token
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = None;
                 }
+                Err(error) => return Err(error),
             }
         }
 
@@ -192,9 +221,13 @@ impl NanaLiveClient {
             return Err(NanaLiveError::AuthenticationTokenMissing);
         };
         if let Some(on_token) = &self.on_token {
-            on_token(&token);
+            // 用户回调 panic 不能外溢到泵任务或会话任务。
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_token(&token)));
         }
-        *self.token.lock().unwrap() = Some(token.clone());
+        *self
+            .token
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(token.clone());
 
         let payload = Value::Map(vec![("authenticationToken".into(), token.into())]);
         self.request("AuthenticationRequest", payload).await

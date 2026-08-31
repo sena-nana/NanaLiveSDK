@@ -15,9 +15,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 备选传输后端：安装后即可 NanaLiveSession(transport="aiohttp")。
+aiohttp = [
+    "aiohttp>=3.10",
+]
+all = [
+    "nanalive-sdk[aiohttp]",
+]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
+    "aiohttp>=3.10",
 ]
 
 [tool.hatch.build.targets.wheel]

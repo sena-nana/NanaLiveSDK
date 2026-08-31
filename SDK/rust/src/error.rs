@@ -22,6 +22,10 @@ pub enum NanaLiveError {
     NotConnected,
     /// 请求在超时时间内没有等到响应。
     RequestTimeout,
+    /// 建链、握手或鉴权超过了 `connect_timeout`。
+    ConnectTimeout,
+    /// 会话选项无效（如 `retry_delay` 为零或大于上限）。
+    InvalidOption(String),
 }
 
 impl NanaLiveError {
@@ -52,6 +56,8 @@ impl fmt::Display for NanaLiveError {
             }
             NanaLiveError::NotConnected => write!(f, "not_connected"),
             NanaLiveError::RequestTimeout => write!(f, "request_timeout"),
+            NanaLiveError::ConnectTimeout => write!(f, "connect_timeout"),
+            NanaLiveError::InvalidOption(message) => write!(f, "invalid_option: {message}"),
         }
     }
 }

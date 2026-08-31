@@ -1,6 +1,9 @@
 const FLOAT64 = new Float64Array(1);
 const FLOAT64_BYTES = new Uint8Array(FLOAT64.buffer);
 
+// 嵌套深度上限：恶意载荷的递归解码不允许打爆调用栈。
+const MAX_DEPTH = 128;
+
 export function encode(value) {
   const bytes = [];
   writeValue(bytes, value);
@@ -14,8 +17,12 @@ export function decode(input) {
       : input instanceof ArrayBuffer
         ? new Uint8Array(input)
         : Uint8Array.from(input);
-  const reader = { bytes, offset: 0 };
-  return readValue(reader);
+  const reader = { bytes, offset: 0, depth: 0 };
+  const value = readValue(reader);
+  if (reader.offset !== bytes.length) {
+    throw new Error("trailing_msgpack_bytes");
+  }
+  return value;
 }
 
 function writeValue(bytes, value) {
@@ -45,7 +52,10 @@ function writeValue(bytes, value) {
   }
   if (typeof value === "object") {
     writeMap(bytes, value);
+    return;
   }
+  // 静默写 0 字节会让流错位，必须在编码期就报错。
+  throw new Error(`unsupported_msgpack_value: ${typeof value}`);
 }
 
 function writeNumber(bytes, value) {
@@ -160,6 +170,18 @@ function writeCollectionHeader(bytes, length, fix, u16, u32) {
 }
 
 function readValue(reader) {
+  if (reader.depth >= MAX_DEPTH) {
+    throw new Error("msgpack_depth_overflow");
+  }
+  reader.depth += 1;
+  try {
+    return readValueInner(reader);
+  } finally {
+    reader.depth -= 1;
+  }
+}
+
+function readValueInner(reader) {
   const byte = readByte(reader);
   if (byte <= 0x7f) return byte;
   if (byte >= 0xe0) return byte - 256;
@@ -224,12 +246,21 @@ function readMap(reader, length) {
   const object = {};
   for (let index = 0; index < length; index += 1) {
     const key = readValue(reader);
-    object[String(key)] = readValue(reader);
+    const value = readValue(reader);
+    const name = String(key);
+    // 挡住改写对象原型/继承属性的键。
+    if (name === "__proto__" || name === "constructor" || name === "prototype") {
+      continue;
+    }
+    object[name] = value;
   }
   return object;
 }
 
 function readString(reader, length) {
+  if (reader.offset + length > reader.bytes.length) {
+    throw new Error("truncated_msgpack");
+  }
   const slice = reader.bytes.subarray(reader.offset, reader.offset + length);
   reader.offset += length;
   return decoder().decode(slice);

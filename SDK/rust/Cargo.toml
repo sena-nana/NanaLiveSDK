@@ -7,7 +7,7 @@ license = "MIT"
 readme = "README.md"
 
 [dependencies]
-tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 rmpv = "1"

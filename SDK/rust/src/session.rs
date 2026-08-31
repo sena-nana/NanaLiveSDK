@@ -5,15 +5,16 @@
 //! 通过 `on_status` 回调观察 [`SessionStatus`] 状态变化。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use rmpv::Value;
 use tokio::sync::watch;
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::client::{Identity, NanaLiveClient, TokenCallback};
 use crate::connection::{
-    connect_with_client, now_millis, ConnectionHandle, ConnectOptions, ErrorCallback,
+    connect_with_client, guard, now_millis, ConnectionHandle, ConnectOptions, ErrorCallback,
     UnhandledCallback,
 };
 use crate::error::NanaLiveError;
@@ -47,7 +48,7 @@ pub struct SessionOptions {
     pub on_token: Option<TokenCallback>,
     /// 未配对请求的响应（服务器主动推送）。
     pub on_unhandled: Option<UnhandledCallback>,
-    /// 泵任务中的协议/连接错误。
+    /// 泵任务中的协议/连接错误，以及重连失败的原因。
     pub on_error: Option<ErrorCallback>,
     /// 连接状态变化回调。
     pub on_status: Option<StatusCallback>,
@@ -63,6 +64,8 @@ pub struct SessionOptions {
     pub heartbeat_interval: Duration,
     /// 心跳超时，默认 5s；ping 后仍无任何入站帧即视为死链。
     pub heartbeat_timeout: Duration,
+    /// 建链、握手与鉴权的总时长上限，默认 5s；`None` 表示不限制。
+    pub connect_timeout: Option<Duration>,
     /// 单请求超时，默认 30s；`None` 表示不限制。
     pub request_timeout: Option<Duration>,
 }
@@ -84,6 +87,7 @@ impl Default for SessionOptions {
             max_retry_delay: Duration::from_millis(8000),
             heartbeat_interval: Duration::from_secs(10),
             heartbeat_timeout: Duration::from_secs(5),
+            connect_timeout: Some(Duration::from_secs(5)),
             request_timeout: Some(Duration::from_secs(30)),
         }
     }
@@ -91,7 +95,8 @@ impl Default for SessionOptions {
 
 struct SessionState {
     status: SessionStatus,
-    /// 连接代数；每次重新建立会话时递增，旧的后台任务据此退出。
+    /// 连接代数；`connect()`/`close()` 递增，旧的后台任务据此退出，
+    /// 且绝不能改动新一代的共享状态。
     generation: u64,
 }
 
@@ -104,33 +109,51 @@ pub struct NanaLiveSession {
     options: SessionOptions,
     client: Arc<NanaLiveClient>,
     /// 当前连接；`send` 闭包据此把请求写给正在生效的连接。
+    ///
+    /// 不变式：所有 slot 变更都必须持有 `state` 锁（换代检查与写入
+    /// 在同一临界区内），这样旧代任务不可能覆盖新一代的连接。
     slot: Arc<RwLock<Option<Arc<ConnectionHandle>>>>,
-    /// 当前连接的断开信号；establish 时设置，close 时触发。
-    disconnected: Mutex<Option<watch::Sender<u64>>>,
+    /// 当前连接的断开信号，连同所属代数一起存取。
+    disconnected: Mutex<Option<(u64, watch::Sender<u64>)>>,
     state: Mutex<SessionState>,
     closed: AtomicBool,
 }
 
 impl NanaLiveSession {
-    pub fn new(options: SessionOptions) -> Self {
+    /// 创建会话；选项非法时返回 [`NanaLiveError::InvalidOption`]。
+    pub fn new(options: SessionOptions) -> Result<Self, NanaLiveError> {
         if options.heartbeat_interval.is_zero() {
-            panic!("heartbeat_interval must be positive");
+            return Err(NanaLiveError::InvalidOption(
+                "heartbeat_interval must be positive".to_string(),
+            ));
+        }
+        if options.retry_delay.is_zero() || options.max_retry_delay < options.retry_delay {
+            return Err(NanaLiveError::InvalidOption(
+                "retry_delay must be positive and not exceed max_retry_delay".to_string(),
+            ));
         }
         let slot = Arc::new(RwLock::new(None));
         let client_slot = Arc::clone(&slot);
         let client = Arc::new(NanaLiveClient::new(
             move |bytes: Vec<u8>| {
-                let handle: Option<Arc<ConnectionHandle>> =
-                    client_slot.read().unwrap().clone();
-                if let Some(handle) = handle {
-                    handle.send_raw(tokio_tungstenite::tungstenite::Message::Binary(bytes));
+                let handle: Option<Arc<ConnectionHandle>> = client_slot
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                match handle {
+                    // 出站通道已关闭（连接刚死）按断线处理，请求立刻失败。
+                    Some(handle) if handle.send_raw(Message::Binary(bytes)) => Ok(()),
+                    Some(_) => Err(NanaLiveError::ConnectionClosed(
+                        "connection_lost".to_string(),
+                    )),
+                    None => Err(NanaLiveError::NotConnected),
                 }
             },
             options.identity.clone(),
             options.token.clone(),
             options.on_token.clone(),
         ));
-        Self {
+        Ok(Self {
             options,
             client,
             slot,
@@ -140,7 +163,7 @@ impl NanaLiveSession {
                 generation: 0,
             }),
             closed: AtomicBool::new(false),
-        }
+        })
     }
 
     /// 底层协议客户端（token 在多次重连之间保持复用）。
@@ -149,12 +172,31 @@ impl NanaLiveSession {
     }
 
     pub fn status(&self) -> SessionStatus {
-        self.state.lock().unwrap().status
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .status
+    }
+
+    /// 会话是否处于已连接且连接仍在位的状态。
+    pub fn is_connected(&self) -> bool {
+        let connected = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .status
+            == SessionStatus::Connected;
+        connected
+            && self
+                .slot
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_some()
     }
 
     fn set_status(&self, status: SessionStatus) {
         let callback = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             if state.status == status {
                 return;
             }
@@ -162,34 +204,75 @@ impl NanaLiveSession {
             self.options.on_status.clone()
         };
         if let Some(callback) = callback {
-            callback(status);
+            guard(move || callback(status));
+        }
+    }
+
+    /// 只有 `generation` 仍是当前代时才变更状态（旧 monitor 不得改写新代状态）。
+    fn set_status_if_current(&self, generation: u64, status: SessionStatus) {
+        if self.is_closed() || self.generation() != generation {
+            return;
+        }
+        self.set_status(status);
+    }
+
+    fn report_error(&self, message: &str) {
+        if let Some(on_error) = &self.options.on_error {
+            guard(|| on_error(message.to_string()));
         }
     }
 
     fn generation(&self) -> u64 {
-        self.state.lock().unwrap().generation
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .generation
     }
 
-    fn next_generation(&self) -> u64 {
-        let mut state = self.state.lock().unwrap();
-        state.generation += 1;
-        state.generation
-    }
-
-    /// 更新当前连接与断开信号；返回被替换的旧连接（调用方负责关闭）。
-    fn set_slot(
+    /// 更新当前连接与断开信号；仅当 `generation` 仍是当前代时生效。
+    ///
+    /// 换代检查与写入在 `state` 锁的同一临界区内完成，与
+    /// `connect()`/`close()` 的换代操作互斥，旧代任务不可能覆盖新连接。
+    fn replace_slot(
         &self,
+        generation: u64,
         handle: Option<Arc<ConnectionHandle>>,
         signal: Option<watch::Sender<u64>>,
     ) -> Option<Arc<ConnectionHandle>> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.generation != generation {
+            return None;
+        }
         let previous;
         {
-            let mut slot = self.slot.write().unwrap();
+            let mut slot = self.slot.write().unwrap_or_else(PoisonError::into_inner);
             previous = slot.take();
             *slot = handle;
         }
-        *self.disconnected.lock().unwrap() = signal;
+        *self
+            .disconnected
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = signal.map(|sender| (generation, sender));
         previous
+    }
+
+    /// 清出指定连接；仅当代数未变且 slot 仍指向它时生效（防误清新连接）。
+    fn clear_slot_if_current(&self, generation: u64, handle: &Arc<ConnectionHandle>) {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.generation != generation {
+            return;
+        }
+        let mut slot = self.slot.write().unwrap_or_else(PoisonError::into_inner);
+        let is_own = slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, handle));
+        if is_own {
+            *slot = None;
+            *self
+                .disconnected
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+        }
     }
 
     fn is_closed(&self) -> bool {
@@ -202,12 +285,32 @@ impl NanaLiveSession {
     /// 且连不上）时返回最后的错误。重复调用会重置会话并重新连接。
     pub async fn connect(self: &Arc<Self>) -> Result<(), NanaLiveError> {
         self.closed.store(false, Ordering::SeqCst);
-        if let Some(previous) = self.set_slot(None, None) {
+        // 换代并清出旧连接在同一临界区内完成：被取代的 establish/
+        // monitor 的换代前检查都过不去，绝不会覆盖新连接。
+        let (generation, previous) = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.generation += 1;
+            let generation = state.generation;
+            let previous = self
+                .slot
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            *self
+                .disconnected
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+            (generation, previous)
+        };
+        if let Some(handle) = previous {
             // 重置会话时关闭被替换的旧连接，避免泄漏。
-            previous.close().await;
-            previous.task.abort();
+            handle.close().await;
+            handle.task.abort();
         }
-        let generation = self.next_generation();
+        // 被替换连接上的挂起请求立即失败，而不是干等请求超时。
+        self.client.fail_pending(NanaLiveError::ConnectionClosed(
+            "connection_lost".to_string(),
+        ));
 
         let mut attempt: u32 = 0;
         let mut last_error;
@@ -217,9 +320,9 @@ impl NanaLiveSession {
             } else {
                 SessionStatus::Reconnecting
             });
-            match self.establish().await {
+            match self.establish(generation).await {
                 Ok((handle, last_activity, signal)) => {
-                    self.set_status(SessionStatus::Connected);
+                    self.set_status_if_current(generation, SessionStatus::Connected);
                     self.spawn_monitor(generation, handle, last_activity, signal);
                     return Ok(());
                 }
@@ -233,12 +336,21 @@ impl NanaLiveSession {
                 return Err(last_error);
             }
             tokio::time::sleep(self.backoff(attempt)).await;
+            if self.is_closed() || self.generation() != generation {
+                // 退避期间被 close()/再次 connect() 取代：本轮放弃。
+                self.set_status(SessionStatus::Disconnected);
+                return Err(NanaLiveError::ConnectionClosed("superseded".to_string()));
+            }
         }
     }
 
     /// 建立一次连接并完成鉴权；成功后接管 slot 与断开信号。
+    ///
+    /// 建链与鉴权受 `connect_timeout` 约束；期间被 `connect()`/`close()`
+    /// 换代时，丢弃半开连接并返回 superseded。
     async fn establish(
         &self,
+        generation: u64,
     ) -> Result<(Arc<ConnectionHandle>, Arc<AtomicU64>, watch::Sender<u64>), NanaLiveError> {
         let last_activity = Arc::new(AtomicU64::new(now_millis()));
         let (signal, _) = watch::channel(0u64);
@@ -260,11 +372,33 @@ impl NanaLiveSession {
             })),
         };
 
-        let handle = connect_with_client(options, self.client()).await?;
+        let connect_future = connect_with_client(options, self.client());
+        let handle = match self.options.connect_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, connect_future).await {
+                Ok(result) => result?,
+                Err(_) => return Err(NanaLiveError::ConnectTimeout),
+            },
+            None => connect_future.await?,
+        };
         let handle = Arc::new(handle);
-        self.set_slot(Some(Arc::clone(&handle)), Some(signal.clone()));
-        if let Err(error) = self.client.authenticate().await {
-            self.set_slot(None, None);
+        if self.is_closed() || self.generation() != generation {
+            // 已被新的 connect()/close() 取代：丢弃半开连接。
+            handle.close().await;
+            handle.task.abort();
+            return Err(NanaLiveError::ConnectionClosed("superseded".to_string()));
+        }
+        self.replace_slot(generation, Some(Arc::clone(&handle)), Some(signal.clone()));
+
+        let auth_future = self.client.authenticate();
+        let auth_result = match self.options.connect_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, auth_future).await {
+                Ok(result) => result,
+                Err(_) => Err(NanaLiveError::ConnectTimeout),
+            },
+            None => auth_future.await,
+        };
+        if let Err(error) = auth_result {
+            self.replace_slot(generation, None, None);
             handle.close().await;
             handle.task.abort();
             return Err(error);
@@ -284,15 +418,19 @@ impl NanaLiveSession {
         tokio::spawn(async move {
             monitor_connection(&session, &handle, &last_activity, &signal, generation).await;
 
-            // 连接已断：让挂起中的请求立刻失败。
-            session.client.fail_pending(NanaLiveError::ConnectionClosed(
-                "connection_lost".to_string(),
-            ));
-            session.set_slot(None, None);
-
+            // 只在仍是当前代时清理共享状态；被 connect()/close() 取代的
+            // 旧 monitor 绝不能误清新连接的 slot 或误杀其挂起请求。
             if session.is_closed() || session.generation() != generation {
                 return;
             }
+            // 连接已断：让挂起中的请求立刻失败，并清出 slot。
+            session
+                .client
+                .fail_pending(NanaLiveError::ConnectionClosed(
+                    "connection_lost".to_string(),
+                ));
+            session.clear_slot_if_current(generation, &handle);
+
             if !session.options.reconnect {
                 session.set_status(SessionStatus::Disconnected);
                 return;
@@ -302,21 +440,28 @@ impl NanaLiveSession {
             loop {
                 attempt += 1;
                 if session.options.max_retries.is_some_and(|max| attempt > max) {
-                    session.set_status(SessionStatus::Disconnected);
+                    session.report_error("reconnect_retries_exhausted");
+                    session.set_status_if_current(generation, SessionStatus::Disconnected);
                     return;
                 }
-                session.set_status(SessionStatus::Reconnecting);
+                session.set_status_if_current(generation, SessionStatus::Reconnecting);
                 tokio::time::sleep(session.backoff(attempt)).await;
                 if session.is_closed() || session.generation() != generation {
                     return;
                 }
-                match session.establish().await {
+                match session.establish(generation).await {
                     Ok((handle, last_activity, signal)) => {
-                        session.set_status(SessionStatus::Connected);
+                        session.set_status_if_current(generation, SessionStatus::Connected);
                         session.spawn_monitor(generation, handle, last_activity, signal);
                         return;
                     }
-                    Err(_) => continue,
+                    Err(error) => {
+                        if session.is_closed() || session.generation() != generation {
+                            return;
+                        }
+                        // 重连失败原因必须可观测，否则只能看到永远在重连。
+                        session.report_error(&error.to_string());
+                    }
                 }
             }
         });
@@ -346,7 +491,12 @@ impl NanaLiveSession {
     /// 会话未连接时返回 [`NanaLiveError::NotConnected`]；超过
     /// `request_timeout` 返回 [`NanaLiveError::RequestTimeout`]。
     pub async fn request(&self, message_type: &str, data: Value) -> Result<Value, NanaLiveError> {
-        if self.slot.read().unwrap().is_none() {
+        if self
+            .slot
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none()
+        {
             return Err(NanaLiveError::NotConnected);
         }
         let pending = self.client.request(message_type, data);
@@ -362,9 +512,24 @@ impl NanaLiveSession {
     /// 停止重连并关闭底层连接；挂起中的请求立即失败。
     pub async fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
-        self.next_generation();
-        let handle = self.slot.write().unwrap().take();
-        let signal = self.disconnected.lock().unwrap().take();
+        // 换代与清出连接在同一临界区内，旧的 establish/monitor 不会
+        // 再碰共享状态（见 replace_slot/clear_slot_if_current）。
+        let (handle, signal) = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.generation += 1;
+            let handle = self
+                .slot
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            let signal = self
+                .disconnected
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .map(|(_, sender)| sender);
+            (handle, signal)
+        };
         if let Some(signal) = signal {
             // 唤醒监听中的 monitor，让它看到 closed 后退出。
             let _ = signal.send(1);

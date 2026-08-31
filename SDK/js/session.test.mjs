@@ -47,6 +47,10 @@ const MODELS_BEHAVIOR = {
   dropWithoutAnswer: "dropWithoutAnswer",
   /** 不回答也不断开，用于请求超时测试。 */
   silent: "silent",
+  /** 第一次回答前先拖 400ms（比客户端超时晚），之后正常回答。 */
+  delayFirst: "delayFirst",
+  /** 第一次回答 APIError 且 data 为字符串，之后正常回答。 */
+  errorOnceWithBadData: "errorOnceWithBadData",
 };
 
 /** 服务端帧：不加掩码。 */
@@ -105,6 +109,8 @@ function decodeClientFrame(buffer) {
  */
 function startMockServer(modelsBehavior) {
   const sockets = new Set();
+  let connections = 0;
+  let modelsRequests = 0;
   const server = net.createServer((socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
@@ -136,6 +142,7 @@ function startMockServer(modelsBehavior) {
         );
         handshaken = true;
         index += 1;
+        connections += 1;
       }
       while (handshaken) {
         const frame = decodeClientFrame(buffer);
@@ -166,6 +173,23 @@ function startMockServer(modelsBehavior) {
           if (modelsBehavior === MODELS_BEHAVIOR.silent) {
             continue;
           }
+          if (modelsBehavior === MODELS_BEHAVIOR.delayFirst) {
+            modelsRequests += 1;
+            if (modelsRequests === 1) {
+              setTimeout(() => {
+                socket.write(encodeServerFrame(2, encode(response)));
+              }, 400);
+              continue;
+            }
+          }
+          if (modelsBehavior === MODELS_BEHAVIOR.errorOnceWithBadData) {
+            modelsRequests += 1;
+            if (modelsRequests === 1) {
+              const bad = envelope(request.requestID, "APIError", "boom");
+              socket.write(encodeServerFrame(2, encode(bad)));
+              continue;
+            }
+          }
         }
         socket.write(encodeServerFrame(2, encode(response)));
       }
@@ -176,6 +200,7 @@ function startMockServer(modelsBehavior) {
     server.listen(0, "127.0.0.1", () => {
       resolve({
         port: server.address().port,
+        connectionCount: () => connections,
         close: () => {
           // 半关闭的 socket 会挂住进程，强制清掉。
           for (const socket of sockets) socket.destroy();
@@ -264,6 +289,96 @@ test("session pending requests fail on drop", async () => {
 
   await session.connect();
   await assert.rejects(session.request("AvailableModelsRequest"), /connection_lost/);
+  await session.close();
+  server.close();
+});
+
+test("connectTimeout aborts a black-holed handshake", async () => {
+  // 接受 TCP 连接但从不回应握手的"黑洞"服务端。
+  const sockets = new Set();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+
+  const session = createNanaLiveSession({
+    port,
+    identity: IDENTITY,
+    connectTimeout: 200,
+    reconnect: false,
+    retryDelay: 10,
+    maxRetryDelay: 20,
+  });
+  await assert.rejects(session.connect(), /connect_timeout/);
+  await session.close();
+  for (const socket of sockets) socket.destroy();
+  server.close();
+});
+
+test("second connect() while connected does not deadlock", async () => {
+  const server = await startMockServer(MODELS_BEHAVIOR.answer);
+  const session = createNanaLiveSession({
+    port: server.port,
+    identity: IDENTITY,
+    retryDelay: 50,
+    maxRetryDelay: 100,
+    requestTimeout: 2000,
+  });
+
+  await session.connect();
+  const deadline = new Promise((_, reject) => {
+    setTimeout(() => reject(new Error("connect_deadlocked")), 3000);
+  });
+  await Promise.race([session.connect(), deadline]);
+  assert.equal(session.isConnected, true);
+  const models = await session.request("AvailableModelsRequest");
+  assert.equal(models.data.models[0].modelID, "m-1");
+  await session.close();
+  server.close();
+});
+
+test("late response after timeout does not kill the connection", async () => {
+  const server = await startMockServer(MODELS_BEHAVIOR.delayFirst);
+  const statuses = [];
+  const session = createNanaLiveSession({
+    port: server.port,
+    identity: IDENTITY,
+    onStatus: (status) => statuses.push(status),
+    retryDelay: 50,
+    maxRetryDelay: 100,
+    requestTimeout: 150,
+  });
+
+  await session.connect();
+  await assert.rejects(session.request("AvailableModelsRequest"), /request_timeout/);
+  // 服务端 400ms 后补发迟到响应：必须被静默吸收，不得触发重连。
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  assert.equal(statuses.includes("reconnecting"), false, "迟到响应不应触发重连");
+  assert.equal(session.isConnected, true);
+  assert.equal(server.connectionCount(), 1, "不应发生重连");
+  const models = await session.request("AvailableModelsRequest");
+  assert.equal(models.data.models[0].modelID, "m-1");
+  await session.close();
+  server.close();
+});
+
+test("malformed APIError data does not kill the connection", async () => {
+  const server = await startMockServer(MODELS_BEHAVIOR.errorOnceWithBadData);
+  const session = createNanaLiveSession({
+    port: server.port,
+    identity: IDENTITY,
+    retryDelay: 50,
+    maxRetryDelay: 100,
+    requestTimeout: 2000,
+  });
+
+  await session.connect();
+  await assert.rejects(session.request("AvailableModelsRequest"), /api_error/);
+  assert.equal(session.isConnected, true, "畸形错误消息不应断开连接");
+  const models = await session.request("AvailableModelsRequest");
+  assert.equal(models.data.models[0].modelID, "m-1");
   await session.close();
   server.close();
 });
