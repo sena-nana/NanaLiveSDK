@@ -155,6 +155,42 @@ Python 的 `aiohttp` 后端 pong 判死窗口同为间隔一半。
 回调 / `receive` 返回值、Python 的 `on_unhandled` 回调 / `receive` 返回值、
 C# 的 `OnUnhandled` 事件 / `Receive` 返回值、JS 的 `onUnhandled` 回调 / `receive` 返回值。
 
+## 错误码
+
+请求失败时响应为 `messageType == "APIError"`，`data` 带 `errorCode`、`message` 与 `retryable`。各绑定都导出同一份常量：JS 的 `ErrorCode` / `RETRYABLE_ERROR_CODES`，Python 的 `ErrorCode` / `RETRYABLE_ERROR_CODES`，Rust 的 `error_code` 模块（`error_code::RETRYABLE`），C# 的 `ErrorCodes`（`ErrorCodes.Retryable`）。
+
+| `errorCode` | 含义 | 可重试 |
+| --- | --- | --- |
+| `UNSUPPORTED_API_VERSION` | 不支持的 apiVersion | 否 |
+| `INVALID_REQUEST` | 请求格式或字段无效 | 否 |
+| `MESSAGE_TOO_LARGE` | 消息超出大小上限 | 否 |
+| `AUTHENTICATION_REQUIRED` | 需要先鉴权 | 否 |
+| `AUTHENTICATION_TOKEN_INVALID` | token 无效 | 否 |
+| `AUTHENTICATION_REVOKED` | 授权已被用户撤销 | 否 |
+| `USER_DENIED` | 用户拒绝 | 否 |
+| `USER_CONFIRMATION_TIMEOUT` | 用户没有在时限内回答 | 是 |
+| `PERMISSION_DENIED` | 授权里没有所需 scope | 否 |
+| `SCOPE_UPGRADE_REQUIRED` | 需要追加 scope | 否 |
+| `DISPLAY_UNAVAILABLE` | 舞台或窗口不可用 | 是 |
+| `MODEL_NOT_LOADED` | 舞台上没有模型 | 否 |
+| `MODEL_NOT_FOUND` | 没有指定的模型 | 否 |
+| `MODEL_SWITCH_IN_PROGRESS` | 正在换模型 | 是 |
+| `EXPRESSION_NOT_FOUND` | 没有指定的表情 | 否 |
+| `MOTION_NOT_FOUND` | 没有指定的动作 | 否 |
+| `HOTKEY_NOT_FOUND` | 没有指定的快捷键 | 否 |
+| `HOTKEY_NOT_EXECUTABLE` | 快捷键不可执行 | 否 |
+| `ITEM_NOT_FOUND` | 没有指定的挂件 | 否 |
+| `ART_MESH_NOT_FOUND` | 模型没有指定的网格 | 否 |
+| `COOLDOWN_ACTIVE` | 冷却未过（NDI 设置 3 秒一次、换模型） | 是 |
+| `PROMPT_PENDING` | 已有问题在等用户回答 | 是 |
+| `CONTROLLED_BY_OTHER_PLUGIN` | 另一个插件正持有它（物理覆盖） | 是 |
+| `UNSUPPORTED` | 本构建、本平台或当前版本不支持 | 否 |
+| `CONTROL_BUSY` | 目标正忙（如动作正在播放） | 是 |
+| `RATE_LIMITED` | 超出该类请求的限流配额 | 是 |
+| `INTERNAL_ERROR` | NanaLive 内部错误 | 是 |
+
+超出限流配额回 `RATE_LIMITED`；换模型超出配额回 `COOLDOWN_ACTIVE`。各类请求的限流配额见 NanaLive 仓库的 [插件指南](https://github.com/sena-nana/NanaLive/blob/main/docs/guide/plugins.md)。
+
 ## 其他
 
 Rust 侧的协议与消息定义目前随主程序仓库（`nanalive-plugin-api` crate）发布，正式外发到本仓库 `SDK/` 后会在此补充索引。

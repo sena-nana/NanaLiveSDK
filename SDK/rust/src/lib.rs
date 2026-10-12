@@ -16,7 +16,7 @@ pub use client::{Identity, NanaLiveClient};
 pub use connection::{
     connect, connect_with_client, ConnectionHandle, ConnectOptions,
 };
-pub use error::NanaLiveError;
+pub use error::{error_code, NanaLiveError};
 pub use helpers::{executable_hotkeys, parameter_value_after_ticks, write_parameter_command};
 pub use session::{NanaLiveSession, SessionOptions, SessionStatus};
 
